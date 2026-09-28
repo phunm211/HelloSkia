@@ -286,10 +286,9 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
     font.setEdging(SkFont::Edging::kAntiAlias);
     font.setSubpixel(true);
 
-    // Option A: Match Android TextView's paint.setFakeBoldText(true)
-    if (isBold) {
-        font.setEmbolden(true);
-    }
+    // Matching Android HWUI: large text disables hinting (kNone) and uses linear metrics
+    font.setHinting(SkFontHinting::kNone);
+    font.setLinearMetrics(true);
 
     // Match Android TextView's paint.setTextSkewX(-0.25f)
     if (isItalic) {
@@ -300,12 +299,23 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
     textPaint.setColor(SkColorSetRGB(25, 118, 210)); // #1976D2 matching left column
     textPaint.setAntiAlias(true);
 
+    // Option A: Android HWUI implements paint.setFakeBoldText(true) by applying stroke-and-fill:
+    // strokeWidth = textSize / 30.0f (~7.2px for 216px text).
+    // This perfectly preserves the inner counter (aperture) of glyphs like 'e'
+    // without over-expanding like FreeType's FT_GlyphSlot_Embolden (1/24).
+    if (isBold) {
+        textPaint.setStyle(SkPaint::kStrokeAndFill_Style);
+        textPaint.setStrokeWidth(globalTextSizePx / 30.0f);
+        textPaint.setStrokeJoin(SkPaint::kRound_Join);
+        textPaint.setStrokeCap(SkPaint::kRound_Cap);
+    }
+
     // Measure and center text horizontally & vertically exactly like Android TextView
     SkFontMetrics metrics;
     font.getMetrics(&metrics);
 
     SkRect bounds;
-    SkScalar textWidth = font.measureText(text, strlen(text), SkTextEncoding::kUTF8, &bounds);
+    SkScalar textWidth = font.measureText(text, strlen(text), SkTextEncoding::kUTF8, &bounds, &textPaint);
 
     // Horizontal centering:
     SkScalar x = (w - textWidth) / 2.0f;
