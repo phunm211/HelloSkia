@@ -213,6 +213,217 @@ Java_com_example_helloskia_MainActivity_nativeResize(JNIEnv*, jobject, jint widt
     createGLTextures(surfaceWidth, cellHeight);
 }
 
+#include <vector>
+#include <string>
+#include <sstream>
+#include "include/core/SkTextBlob.h"
+#include "include/core/SkColorFilter.h"
+#include "include/core/SkBlendMode.h"
+
+// Helper to decode a single UTF-8 codepoint from a byte stream
+static SkUnichar nextUtf8Char(const char*& ptr, const char* end) {
+    if (ptr >= end) return 0;
+    unsigned char c = (unsigned char)*ptr++;
+    if (c < 0x80) return c;
+    if ((c & 0xE0) == 0xC0) {
+        if (ptr >= end) return 0;
+        SkUnichar u = (c & 0x1F) << 6;
+        u |= (*ptr++ & 0x3F);
+        return u;
+    }
+    if ((c & 0xF0) == 0xE0) {
+        if (ptr + 1 >= end) return 0;
+        SkUnichar u = (c & 0x0F) << 12;
+        u |= ((*ptr++ & 0x3F) << 6);
+        u |= (*ptr++ & 0x3F);
+        return u;
+    }
+    if ((c & 0xF8) == 0xF0) {
+        if (ptr + 2 >= end) return 0;
+        SkUnichar u = (c & 0x07) << 18;
+        u |= ((*ptr++ & 0x3F) << 12);
+        u |= ((*ptr++ & 0x3F) << 6);
+        u |= (*ptr++ & 0x3F);
+        return u;
+    }
+    return c;
+}
+
+// Draw a single line with dynamic font fallback for Korean, Emoji, Hebrew, etc.
+static void drawLineWithFallback(SkCanvas* canvas, const std::string& line, SkScalar x, SkScalar y,
+                                 SkFontMgr* fontMgr, sk_sp<SkTypeface> baseTypeface,
+                                 SkScalar textSize, bool isBold, bool isItalic, const SkPaint& textPaint) {
+    if (line.empty()) return;
+
+    struct GlyphItem {
+        sk_sp<SkTypeface> typeface;
+        SkGlyphID glyphId;
+        SkScalar advance;
+    };
+
+    std::vector<GlyphItem> glyphs;
+    const char* ptr = line.data();
+    const char* end = ptr + line.size();
+
+    // Cache recently resolved typefaces to minimize SkFontMgr queries
+    sk_sp<SkTypeface> lastTf = baseTypeface;
+
+    SkFontStyle targetStyle = isBold ? (isItalic ? SkFontStyle::BoldItalic() : SkFontStyle::Bold())
+                                     : (isItalic ? SkFontStyle::Italic() : SkFontStyle::Normal());
+
+    while (ptr < end) {
+        SkUnichar u = nextUtf8Char(ptr, end);
+        if (u == 0) break;
+
+        sk_sp<SkTypeface> matchedTf;
+        SkGlyphID gid = 0;
+
+        // 1. Try base typeface first
+        if (baseTypeface) {
+            gid = baseTypeface->unicharToGlyph(u);
+            if (gid != 0) {
+                matchedTf = baseTypeface;
+            }
+        }
+
+        // 2. Try last matched fallback typeface
+        if (gid == 0 && lastTf && lastTf != baseTypeface) {
+            gid = lastTf->unicharToGlyph(u);
+            if (gid != 0) {
+                matchedTf = lastTf;
+            }
+        }
+
+        // 3. Query system fallback font manager for this specific codepoint
+        // Note: Use SkFontStyle::Normal() so we resolve the base fallback font (e.g. Regular),
+        // exactly matching how TextView handles fallback fonts with fakeBold.
+        if (gid == 0 && fontMgr) {
+            matchedTf = fontMgr->matchFamilyStyleCharacter("sans-serif", SkFontStyle::Normal(), nullptr, 0, u);
+            if (matchedTf) {
+                gid = matchedTf->unicharToGlyph(u);
+            }
+        }
+
+        // Fallback to base if still 0
+        if (!matchedTf) {
+            matchedTf = baseTypeface;
+        }
+        lastTf = matchedTf;
+
+        SkFont subFont(matchedTf, textSize);
+        subFont.setEdging(SkFont::Edging::kAntiAlias);
+        subFont.setSubpixel(true);
+        subFont.setHinting(SkFontHinting::kNone);
+        subFont.setLinearMetrics(true);
+        if (isItalic) subFont.setSkewX(-0.25f);
+
+        SkScalar width = 0;
+        // Measure with fake bold stroke width if applicable
+        if (isBold && !matchedTf->isBold()) {
+            subFont.getWidthsBounds(&gid, 1, &width, nullptr, &textPaint);
+        } else {
+            subFont.getWidths(&gid, 1, &width);
+        }
+
+        glyphs.push_back({matchedTf, gid, width});
+    }
+
+    // Now group consecutive glyphs with the same typeface into SkTextBlob runs
+    SkScalar currX = x;
+    size_t i = 0;
+    while (i < glyphs.size()) {
+        sk_sp<SkTypeface> tf = glyphs[i].typeface;
+        size_t runStart = i;
+        while (i < glyphs.size() && glyphs[i].typeface == tf) {
+            i++;
+        }
+        int count = static_cast<int>(i - runStart);
+
+        SkFont runFont(tf, textSize);
+        runFont.setEdging(SkFont::Edging::kAntiAlias);
+        runFont.setSubpixel(true);
+        runFont.setHinting(SkFontHinting::kNone);
+        runFont.setLinearMetrics(true);
+        if (isItalic) runFont.setSkewX(-0.25f);
+
+        SkTextBlobBuilder builder;
+        const auto& runBuffer = builder.allocRunPosH(runFont, count, 0.0f);
+
+        SkScalar runStartX = currX;
+        for (int k = 0; k < count; ++k) {
+            runBuffer.glyphs[k] = glyphs[runStart + k].glyphId;
+            runBuffer.pos[k] = currX - runStartX;
+            currX += glyphs[runStart + k].advance;
+        }
+
+        sk_sp<SkTextBlob> blob = builder.make();
+        if (blob) {
+            // Check if this font is a color emoji font (e.g. NotoColorEmoji)
+            SkString familyName;
+            if (tf) tf->getFamilyName(&familyName);
+            bool isEmoji = (strstr(familyName.c_str(), "Emoji") != nullptr);
+
+            if (isEmoji) {
+                // Emoji fonts are multicolored bitmaps; draw with pure color-filterless paint
+                SkPaint emojiPaint;
+                emojiPaint.setAntiAlias(true);
+                canvas->drawTextBlob(blob, runStartX, y, emojiPaint);
+            } else if (tf && tf->isBold()) {
+                // If the font is already intrinsically bold, draw with normal fill to prevent double bolding
+                SkPaint normalPaint;
+                normalPaint.setColor(textPaint.getColor());
+                normalPaint.setAntiAlias(true);
+                canvas->drawTextBlob(blob, runStartX, y, normalPaint);
+            } else {
+                canvas->drawTextBlob(blob, runStartX, y, textPaint);
+            }
+        }
+    }
+}
+
+// Measure width of a single line using font fallback
+static SkScalar measureLineWidth(const std::string& line, SkFontMgr* fontMgr,
+                                 sk_sp<SkTypeface> baseTypeface, SkScalar textSize,
+                                 bool isBold, const SkPaint& textPaint) {
+    if (line.empty()) return 0.0f;
+    const char* ptr = line.data();
+    const char* end = ptr + line.size();
+    SkScalar totalW = 0.0f;
+    sk_sp<SkTypeface> lastTf = baseTypeface;
+
+    while (ptr < end) {
+        SkUnichar u = nextUtf8Char(ptr, end);
+        if (u == 0) break;
+
+        sk_sp<SkTypeface> matchedTf;
+        SkGlyphID gid = 0;
+        if (baseTypeface) {
+            gid = baseTypeface->unicharToGlyph(u);
+            if (gid != 0) matchedTf = baseTypeface;
+        }
+        if (gid == 0 && lastTf && lastTf != baseTypeface) {
+            gid = lastTf->unicharToGlyph(u);
+            if (gid != 0) matchedTf = lastTf;
+        }
+        if (gid == 0 && fontMgr) {
+            matchedTf = fontMgr->matchFamilyStyleCharacter("sans-serif", SkFontStyle::Normal(), nullptr, 0, u);
+            if (matchedTf) gid = matchedTf->unicharToGlyph(u);
+        }
+        if (!matchedTf) matchedTf = baseTypeface;
+        lastTf = matchedTf;
+
+        SkFont subFont(matchedTf, textSize);
+        SkScalar width = 0;
+        if (isBold && !matchedTf->isBold()) {
+            subFont.getWidthsBounds(&gid, 1, &width, nullptr, &textPaint);
+        } else {
+            subFont.getWidths(&gid, 1, &width);
+        }
+        totalW += width;
+    }
+    return totalW;
+}
+
 // Render content into a single backend texture
 static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool isItalic, const char* text) {
     GrGLTextureInfo glInfo;
@@ -222,8 +433,7 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
 
     auto backendTex = GrBackendTextures::MakeGL(w, h, skgpu::Mipmapped::kNo, glInfo);
 
-    // Matching Android HWUI text gamma & contrast:
-    // Android HWUI uses text gamma ~1.4 for black text on white background and kUnknown pixel geometry
+    // Matching Android HWUI text gamma & contrast
     SkSurfaceProps surfaceProps(0, kUnknown_SkPixelGeometry, 0.0f, 1.4f);
 
     sk_sp<SkSurface> cellSurface = SkSurfaces::WrapBackendTexture(
@@ -252,7 +462,7 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
     borderPaint.setStrokeWidth(2.0f);
     canvas->drawRect(SkRect::MakeWH(w, h), borderPaint);
 
-    // 3. Resolve base typeface matching "sans-serif" Normal (Weight 400) - exactly what TextView uses
+    // 3. Resolve base typeface matching "sans-serif" Normal (Weight 400)
     static sk_sp<SkFontMgr> androidFontMgr = nullptr;
     if (!androidFontMgr) {
         androidFontMgr = SkFontMgr_New_Android(nullptr);
@@ -269,40 +479,11 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
         }
     }
 
-    SkString familyName("Unknown");
-    SkString psName("Unknown");
-    if (typeface) {
-        typeface->getFamilyName(&familyName);
-        typeface->getPostScriptName(&psName);
-        LOGI("[Skia Cell texId=%u] Base font: Family='%s', PostScript='%s', isBold=%b, isItalic=%b",
-             texId, familyName.c_str(), psName.c_str(), isBold, isItalic);
-    } else {
-        LOGE("[Skia Cell texId=%u] Typeface is NULL!", texId);
-    }
-
-    // Use exact pixel size measured directly from Android TextView
-    SkFont font(typeface, globalTextSizePx);
-    // Use Greyscale Anti-Aliasing (same as Android mobile OLED screens)
-    font.setEdging(SkFont::Edging::kAntiAlias);
-    font.setSubpixel(true);
-
-    // Matching Android HWUI: large text disables hinting (kNone) and uses linear metrics
-    font.setHinting(SkFontHinting::kNone);
-    font.setLinearMetrics(true);
-
-    // Match Android TextView's paint.setTextSkewX(-0.25f)
-    if (isItalic) {
-        font.setSkewX(-0.25f);
-    }
-
     SkPaint textPaint;
     textPaint.setColor(SkColorSetRGB(25, 118, 210)); // #1976D2 matching left column
     textPaint.setAntiAlias(true);
 
-    // Option A: Android HWUI implements paint.setFakeBoldText(true) by applying stroke-and-fill:
-    // strokeWidth = textSize / 30.0f (~7.2px for 216px text).
-    // This perfectly preserves the inner counter (aperture) of glyphs like 'e'
-    // without over-expanding like FreeType's FT_GlyphSlot_Embolden (1/24).
+    // Option A: Android HWUI implements paint.setFakeBoldText(true) by applying stroke-and-fill
     if (isBold) {
         textPaint.setStyle(SkPaint::kStrokeAndFill_Style);
         textPaint.setStrokeWidth(globalTextSizePx / 30.0f);
@@ -310,22 +491,36 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
         textPaint.setStrokeCap(SkPaint::kRound_Cap);
     }
 
-    // Measure and center text horizontally & vertically exactly like Android TextView
+    // Split text into individual lines
+    std::vector<std::string> lines;
+    std::stringstream ss(text);
+    std::string item;
+    while (std::getline(ss, item, '\n')) {
+        lines.push_back(item);
+    }
+
+    SkFont baseFont(typeface, globalTextSizePx);
     SkFontMetrics metrics;
-    font.getMetrics(&metrics);
+    baseFont.getMetrics(&metrics);
 
-    SkRect bounds;
-    SkScalar textWidth = font.measureText(text, strlen(text), SkTextEncoding::kUTF8, &bounds, &textPaint);
+    // Line spacing matching Android TextView:
+    // Android TextView uses font.getFontSpacing() = descent - ascent + leading
+    SkScalar lineHeight = metrics.fDescent - metrics.fAscent + metrics.fLeading;
+    SkScalar totalTextBlockHeight = lines.size() * lineHeight;
 
-    // Horizontal centering:
-    SkScalar x = (w - textWidth) / 2.0f;
+    // Start baseline y for vertical centering
+    SkScalar startBaselineY = (h - totalTextBlockHeight) / 2.0f - metrics.fAscent;
 
-    // Vertical centering: Android TextView aligns text based on font metrics:
-    // Middle of font line is (ascent + descent) / 2.
-    // To center vertically in box of height h: baseline = h/2 - (ascent + descent)/2
-    SkScalar y = (h / 2.0f) - ((metrics.fAscent + metrics.fDescent) / 2.0f);
+    for (size_t lineIdx = 0; lineIdx < lines.size(); ++lineIdx) {
+        const std::string& curLine = lines[lineIdx];
+        SkScalar lineWidth = measureLineWidth(curLine, androidFontMgr.get(), typeface, globalTextSizePx,
+                                              isBold, textPaint);
+        SkScalar x = (w - lineWidth) / 2.0f;
+        SkScalar y = startBaselineY + lineIdx * lineHeight;
 
-    canvas->drawString(text, x, y, font, textPaint);
+        drawLineWithFallback(canvas, curLine, x, y, androidFontMgr.get(), typeface,
+                             globalTextSizePx, isBold, isItalic, textPaint);
+    }
 
     // Flush commands to the texture
     grContext->flushAndSubmit();
@@ -338,15 +533,17 @@ Java_com_example_helloskia_MainActivity_nativeRender(JNIEnv*, jobject) {
     int cellW = texWidth;
     int cellH = texHeight;
 
+    const char* sampleText = "Hello\n안녕하세요\n😀🎉🚀\nשלום";
+
     // --- BƯỚC 1: Render 3 nội dung vào 3 OpenGL Textures matching TextView ---
     // Texture 0: Normal (isBold=false, isItalic=false)
-    renderCellToTexture(glTextureIds[0], cellW, cellH, false, false, "Hello");
+    renderCellToTexture(glTextureIds[0], cellW, cellH, false, false, sampleText);
 
     // Texture 1: Bold (isBold=true, isItalic=false)
-    renderCellToTexture(glTextureIds[1], cellW, cellH, true, false, "Hello");
+    renderCellToTexture(glTextureIds[1], cellW, cellH, true, false, sampleText);
 
     // Texture 2: Bold Italic (isBold=true, isItalic=true)
-    renderCellToTexture(glTextureIds[2], cellW, cellH, true, true, "Hello");
+    renderCellToTexture(glTextureIds[2], cellW, cellH, true, true, sampleText);
 
     // --- BƯỚC 2: Render thẳng 3 Texture lên Main Canvas ---
     SkCanvas* mainCanvas = mainSurface->getCanvas();

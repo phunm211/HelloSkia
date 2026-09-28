@@ -62,9 +62,9 @@
                 android:background="@drawable/cell_border"
                 android:fontFamily="sans-serif"
                 android:gravity="center"
-                android:text="Hello"
+                android:text="@string/sample_cell_text"
                 android:textColor="#1976D2"
-                android:textSize="72sp"
+                android:textSize="28sp"
                 android:textStyle="normal" />
 
             <!-- Row 2: Bold -->
@@ -76,9 +76,9 @@
                 android:background="@drawable/cell_border"
                 android:fontFamily="sans-serif"
                 android:gravity="center"
-                android:text="Hello"
+                android:text="@string/sample_cell_text"
                 android:textColor="#1976D2"
-                android:textSize="72sp"
+                android:textSize="28sp"
                 android:textStyle="bold" />
 
             <!-- Row 3: Bold Italic -->
@@ -90,9 +90,9 @@
                 android:background="@drawable/cell_border"
                 android:fontFamily="sans-serif"
                 android:gravity="center"
-                android:text="Hello"
+                android:text="@string/sample_cell_text"
                 android:textColor="#1976D2"
-                android:textSize="72sp"
+                android:textSize="28sp"
                 android:textStyle="bold|italic" />
         </LinearLayout>
 
