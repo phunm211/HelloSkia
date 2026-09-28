@@ -77,13 +77,18 @@ Do một file font Latin cơ sở (`sans-serif` / `RobotoStatic-Regular`) không
 ### Cách triển khai trong Skia:
 1. **UTF-8 Streaming Parser**:
    * Hàm `nextUtf8Char` giải mã từng codepoint Unicode (`SkUnichar`, 1 đến 4 byte).
-2. **Dynamic Fallback qua `SkFontMgr_Android`**:
-   * Kiểm tra font cơ sở: `baseTypeface->unicharToGlyph(u)`.
-   * Nếu không tìm thấy (`glyphId == 0`), gọi `androidFontMgr->matchFamilyStyleCharacter("sans-serif", style, nullptr, 0, u)`.
-   * Hệ thống tự động ánh xạ:
-     * Tiếng Hàn $\rightarrow$ `SamsungKorean-Regular.ttf` / `SECCJK-Regular.ttc`
-     * Emoji $\rightarrow$ `NotoColorEmoji.ttf`
-     * Tiếng Do Thái $\rightarrow$ `NotoSansHebrew-Regular.ttf`
+2. **Dynamic Fallback tự động qua `SkFontMgr_Android` (Không cần tự đọc XML)**:
+   * **Cơ chế ngầm**: Khi khởi tạo `SkFontMgr_New_Android(nullptr)`, Skia tự động tìm và đọc cấu hình font hệ thống Android (`/system/etc/fonts.xml`, `/data/fonts/`, v.v.) và tự xây dựng đồ thị Fallback Fonts theo thứ tự ưu tiên của chính máy đó.
+   * **Không cần hardcode hay tự parse XML**: Nhà phát triển không phải tự viết parser XML hay lo sợ format file XML bị thay đổi qua các bản Android. Skia tự động tương thích với mọi hãng sản xuất (Samsung, Pixel, Xiaomi, Oppo...):
+     * Khi gọi `androidFontMgr->matchFamilyStyleCharacter("sans-serif", style, nullptr, 0, u)`:
+       * Skia duyệt chuỗi fallback của Android, kiểm tra bảng `cmap` của các file font hệ thống.
+       * Tự động tìm thấy và nạp đúng font file hỗ trợ codepoint `u` tại runtime:
+         * Tiếng Hàn $\rightarrow$ `SamsungKorean-Regular.ttf` / `SECCJK-Regular.ttc`
+         * Emoji $\rightarrow$ `NotoColorEmoji.ttf`
+         * Tiếng Do Thái $\rightarrow$ `NotoSansHebrew-Regular.ttf`
+3. **Phân nhóm Run trong `SkTextBlob`**:
+   * Gom các ký tự liên tiếp có cùng `SkTypeface` vào từng run của `SkTextBlobBuilder`.
+   * Tính toán khoảng cách tọa độ `pos` chính xác dựa trên `font.getWidths`.
 4. **Xử lý tránh hiện tượng Double Bold (Chữ Hàn & Hebrew bị quá đậm)**:
    * Khi gọi `matchFamilyStyleCharacter` với `style = Bold`, Android Font Manager sẽ tìm và trả về file font **chính chủ Bold** (ví dụ: `NotoSansHebrew-Bold.ttf`, `SamsungKorean-Bold.ttf`).
    * Nếu Skia tiếp tục áp dụng thêm stroke giả lập bold (`textPaint.setStrokeWidth`) lên một font vốn đã là file Bold thật, glyph sẽ bị cộng dồn 2 lần độ dày (**Double Bold**), khiến chữ tiếng Hàn và Hebrew đậm gấp đôi so với TextView.
