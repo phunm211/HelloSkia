@@ -5,63 +5,113 @@
 #include <GLES3/gl32.h>
 
 #include "include/ports/SkFontMgr_directory.h"
+#include "include/ports/SkFontMgr_android.h"
 #include "include/core/SkFontMgr.h"
 #include "include/core/SkTypeface.h"
 #include "include/core/SkSurface.h"
 #include "include/core/SkColorSpace.h"
 #include "include/core/SkCanvas.h"
 #include "include/core/SkPaint.h"
+#include "include/core/SkFont.h"
+#include "include/core/SkFontMetrics.h"
+#include "include/core/SkFontStyle.h"
+#include "include/core/SkSurfaceProps.h"
 #include "include/gpu/ganesh/GrDirectContext.h"
 #include "include/gpu/ganesh/gl/GrGLInterface.h"
 #include "include/gpu/ganesh/gl/GrGLTypes.h"
 #include "include/gpu/ganesh/GrBackendSurface.h"
-#include "gpu/ganesh/gl/GrGLDirectContext.h"
-#include "gpu/ganesh/gl/GrGLBackendSurface.h"
-#include "gpu/ganesh/SkSurfaceGanesh.h"
-#include "SkFont.h"
+#include "include/gpu/ganesh/SkSurfaceGanesh.h"
+#include "include/gpu/ganesh/SkImageGanesh.h"
+#include "include/gpu/ganesh/gl/GrGLBackendSurface.h"
+#include "include/gpu/ganesh/gl/GrGLDirectContext.h"
 #include "gpu/ganesh/gl/GrGLAssembleInterface.h"
 
 #define LOG_TAG "NativeRenderer"
 #define LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__))
 #define LOGE(...) ((void)__android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__))
+
 static ANativeWindow* nativeWindow = nullptr;
 static EGLDisplay eglDisplay = EGL_NO_DISPLAY;
 static EGLSurface eglSurface = EGL_NO_SURFACE;
 static EGLContext eglContext = EGL_NO_CONTEXT;
 
-sk_sp<GrDirectContext> grContext;
-sk_sp<SkSurface> skSurface;
+static sk_sp<GrDirectContext> grContext;
+static sk_sp<SkSurface> mainSurface;
+
+static int surfaceWidth = 0;
+static int surfaceHeight = 0;
+static float globalTextSizePx = 190.0f;
+static int globalBoldWeight = 700;
+
+// 3 GL Textures
+static GLuint glTextureIds[3] = {0, 0, 0};
+static int texWidth = 0;
+static int texHeight = 0;
+
+static void cleanupGLTextures() {
+    if (glTextureIds[0] != 0 || glTextureIds[1] != 0 || glTextureIds[2] != 0) {
+        glDeleteTextures(3, glTextureIds);
+        glTextureIds[0] = 0;
+        glTextureIds[1] = 0;
+        glTextureIds[2] = 0;
+    }
+}
+
+static void createGLTextures(int width, int height) {
+    cleanupGLTextures();
+    texWidth = width;
+    texHeight = height;
+
+    glGenTextures(3, glTextureIds);
+    for (int i = 0; i < 3; ++i) {
+        glBindTexture(GL_TEXTURE_2D, glTextureIds[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, texWidth, texHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    LOGI("Created 3 GL Textures: [%u, %u, %u] size %dx%d", glTextureIds[0], glTextureIds[1], glTextureIds[2], texWidth, texHeight);
+}
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_example_helloskia_MainActivity_nativeInit(JNIEnv* env, jobject, jobject surface) {
+Java_com_example_helloskia_MainActivity_nativeInit(JNIEnv* env, jobject, jobject surface, jint width, jint height, jfloat textSizePx, jint boldWeight) {
+    surfaceWidth = width;
+    surfaceHeight = height;
+    if (textSizePx > 0.0f) {
+        globalTextSizePx = textSizePx;
+    }
+    if (boldWeight > 0) {
+        globalBoldWeight = boldWeight;
+    }
+    LOGI("nativeInit: textSizePx = %f, boldWeight = %d", globalTextSizePx, globalBoldWeight);
+
     // 1. Get Native Window
     nativeWindow = ANativeWindow_fromSurface(env, surface);
     if (!nativeWindow) {
-        LOGE("nativeInit: ANativeWindow_fromSurface failed. jsurface: %p", surface);
+        LOGE("nativeInit: ANativeWindow_fromSurface failed.");
         return;
     }
-    LOGI("nativeInit: ANativeWindow_fromSurface successful (nativeWindow: %p)", nativeWindow);
 
     // 2. Get EGL Display
     eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (eglDisplay == EGL_NO_DISPLAY) {
         LOGE("nativeInit: eglGetDisplay failed.");
-        ANativeWindow_release(nativeWindow); // Dọn dẹp window đã lấy
+        ANativeWindow_release(nativeWindow);
         nativeWindow = nullptr;
         return;
     }
-    LOGI("nativeInit: eglGetDisplay successful (eglDisplay: %p)", eglDisplay);
 
     // 3. Initialize EGL
     EGLint majorVersion, minorVersion;
     if (!eglInitialize(eglDisplay, &majorVersion, &minorVersion)) {
         LOGE("nativeInit: eglInitialize failed.");
-        eglDisplay = EGL_NO_DISPLAY; // Đánh dấu là không có display hợp lệ
+        eglDisplay = EGL_NO_DISPLAY;
         ANativeWindow_release(nativeWindow);
         nativeWindow = nullptr;
         return;
     }
-    LOGI("nativeInit: EGL Initialized. Version: %d.%d", majorVersion, minorVersion);
 
     EGLConfig eglConfig;
     EGLint numConfigs;
@@ -74,167 +124,248 @@ Java_com_example_helloskia_MainActivity_nativeInit(JNIEnv* env, jobject, jobject
             EGL_NONE
     };
 
-    EGLint esVersionToTry = 3; // Thử ES3 trước
     if (!eglChooseConfig(eglDisplay, configAttribs, &eglConfig, 1, &numConfigs) || numConfigs < 1) {
-        LOGI("nativeInit: eglChooseConfig for ES%d failed or no configs found (numConfigs: %d). Error: 0x%x. Trying ES2...", esVersionToTry, numConfigs, eglGetError());
-        esVersionToTry = 2;
-        configAttribs[1] = EGL_OPENGL_ES2_BIT; // Chuyển sang ES2
-        LOGI("nativeInit: Attempting to choose EGLConfig for OpenGL ES %d", esVersionToTry);
+        configAttribs[1] = EGL_OPENGL_ES2_BIT;
         if (!eglChooseConfig(eglDisplay, configAttribs, &eglConfig, 1, &numConfigs) || numConfigs < 1) {
-            LOGE("nativeInit: eglChooseConfig for ES%d also failed or no configs found (numConfigs: %d).", esVersionToTry, numConfigs);
+            LOGE("nativeInit: eglChooseConfig failed.");
             return;
         }
     }
-    LOGI("nativeInit: eglChooseConfig successful for ES%d (numConfigs: %d, selectedConfig: %p)", esVersionToTry, numConfigs, eglConfig);
+
     EGLint contextAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
     eglContext = eglCreateContext(eglDisplay, eglConfig, EGL_NO_CONTEXT, contextAttribs);
     if (eglContext == EGL_NO_CONTEXT) {
-        LOGE("nativeInit: eglCreateContext failed for ES version %d.", esVersionToTry);
+        LOGE("nativeInit: eglCreateContext failed.");
         return;
     }
 
     eglSurface = eglCreateWindowSurface(eglDisplay, eglConfig, nativeWindow, nullptr);
     if (eglSurface == EGL_NO_SURFACE) {
         LOGE("nativeInit: eglCreateWindowSurface failed!");
-        // Gọi eglGetError() NGAY LẬP TỨC để lấy mã lỗi chính xác
-        EGLint error = eglGetError();
-        LOGE("nativeInit: eglCreateWindowSurface error code: 0x%x", error);
-
-        // Phân tích một số mã lỗi phổ biến:
-        switch (error) {
-            case EGL_BAD_MATCH:
-                LOGE("EGL_BAD_MATCH: Check if native_window or native_display is valid, "
-                     "or if an EGLConfig does not support rendering to a window, "
-                     "or if the EGLConfig does not support the EGL_SURFACE_TYPE attribute EGL_WINDOW_BIT.");
-                break;
-            case EGL_BAD_CONFIG:
-                LOGE("EGL_BAD_CONFIG: egl_config is not a valid EGLConfig.");
-                break;
-            case EGL_BAD_NATIVE_WINDOW:
-                LOGE("EGL_BAD_NATIVE_WINDOW: native_window is not a valid window.");
-                break;
-            case EGL_BAD_ALLOC:
-                LOGE("EGL_BAD_ALLOC: Allocation failed (out of memory or other resources).");
-                break;
-            case EGL_BAD_ATTRIBUTE:
-                LOGE("EGL_BAD_ATTRIBUTE: One or more attributes in attrib_list is invalid or "
-                     "inconsistent (e.g., an attribute repeated).");
-                break;
-            default:
-                LOGE("EGL_UNKNOWN_ERROR: An unknown error occurred.");
-        }
-
-        // Dọn dẹp EGLContext đã được tạo trước đó
-        if (eglContext != EGL_NO_CONTEXT) {
-            eglDestroyContext(eglDisplay, eglContext);
-            eglContext = EGL_NO_CONTEXT;
-        }
-        // Dọn dẹp EGLDisplay
-        if (eglDisplay != EGL_NO_DISPLAY) {
-            eglTerminate(eglDisplay);
-            eglDisplay = EGL_NO_DISPLAY;
-        }
-        // Dọn dẹp NativeWindow
-        if (nativeWindow) {
-            ANativeWindow_release(nativeWindow);
-            nativeWindow = nullptr;
-        }
-        return; // Thoát khỏi hàm init vì đã thất bại
+        return;
     }
-    LOGI("nativeInit: eglCreateWindowSurface successful (eglSurface: %p)", eglSurface);
 
-    // 6. Make EGLContext Current
-    LOGI("nativeInit: Making EGL context current...");
     if (!eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
         LOGE("nativeInit: eglMakeCurrent failed.");
         return;
     }
-    LOGI("nativeInit: eglMakeCurrent successful.");
 
-    auto ptr = eglGetProcAddress("glGetString");
-    if (!ptr) {
-        LOGE("eglGetProcAddress(glGetString) returned nullptr!");
-    } else {
-        LOGI("eglGetProcAddress(glGetString) OK: %p", ptr);
-    }
-
-
-
-    // 7. Initialize Skia GrContext
-    LOGI("nativeInit: Creating GrGLInterface...");
+    // 4. Initialize Skia GrDirectContext
     auto interface = GrGLMakeAssembledInterface(
             nullptr,
             [](void*, const char name[]) -> GrGLFuncPtr {
-                auto ptr = eglGetProcAddress(name);
-                if (!ptr) {
-                    LOGE("eglGetProcAddress failed for %s", name);
-                }
-                return reinterpret_cast<GrGLFuncPtr>(ptr);
+                return reinterpret_cast<GrGLFuncPtr>(eglGetProcAddress(name));
             });
     if (!interface) {
-        LOGE("nativeInit: GrGLMakeNativeInterface failed to create an interface.");
+        LOGE("nativeInit: GrGLMakeAssembledInterface failed.");
         return;
     }
-    LOGI("nativeInit: GrGLInterface created successfully.");
 
-    LOGI("nativeInit: Creating GrDirectContext...");
     grContext = GrDirectContexts::MakeGL(interface);
     if (!grContext) {
-        LOGE("nativeInit: GrDirectContexts::MakeGL failed to create a context.");
-        // Interface được GrDirectContext sở hữu, không cần giải phóng riêng nếu MakeGL thành công.
-        // Nếu MakeGL thất bại, interface sẽ tự động được giải phóng (do là sk_sp).
+        LOGE("nativeInit: GrDirectContexts::MakeGL failed.");
         return;
     }
-    LOGI("nativeInit: GrDirectContext created successfully (grContext: %p)", grContext.get());
 
-    int width = ANativeWindow_getWidth(nativeWindow);
-    int height = ANativeWindow_getHeight(nativeWindow);
+    // 5. Wrap Main Window RenderTarget
+    GrGLFramebufferInfo fbInfo;
+    fbInfo.fFBOID = 0;
+    fbInfo.fFormat = GL_RGBA8;
+
+    auto backendRT = GrBackendRenderTargets::MakeGL(surfaceWidth, surfaceHeight, 0, 8, fbInfo);
+    mainSurface = SkSurfaces::WrapBackendRenderTarget(
+            grContext.get(), backendRT,
+            kBottomLeft_GrSurfaceOrigin,
+            kRGBA_8888_SkColorType,
+            SkColorSpace::MakeSRGB(),
+            nullptr);
+
+    // 6. Create 3 OpenGL textures for 3 cells
+    int cellHeight = surfaceHeight / 3;
+    createGLTextures(surfaceWidth, cellHeight);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_helloskia_MainActivity_nativeResize(JNIEnv*, jobject, jint width, jint height, jfloat textSizePx, jint boldWeight) {
+    surfaceWidth = width;
+    surfaceHeight = height;
+    if (textSizePx > 0.0f) {
+        globalTextSizePx = textSizePx;
+    }
+    if (boldWeight > 0) {
+        globalBoldWeight = boldWeight;
+    }
+    if (!grContext) return;
 
     GrGLFramebufferInfo fbInfo;
     fbInfo.fFBOID = 0;
     fbInfo.fFormat = GL_RGBA8;
 
-    int sampleCount = 0;     // không dùng MSAA
-    int stencilBits = 8;     // stencil buffer 8 bits
-
-    auto backendRT = GrBackendRenderTargets::MakeGL(width, height, sampleCount, stencilBits, fbInfo);
-
-    SkColorType colorType = kRGBA_8888_SkColorType;
-    skSurface = SkSurfaces::WrapBackendRenderTarget(
+    auto backendRT = GrBackendRenderTargets::MakeGL(surfaceWidth, surfaceHeight, 0, 8, fbInfo);
+    mainSurface = SkSurfaces::WrapBackendRenderTarget(
             grContext.get(), backendRT,
             kBottomLeft_GrSurfaceOrigin,
-            colorType,
+            kRGBA_8888_SkColorType,
             SkColorSpace::MakeSRGB(),
             nullptr);
+
+    int cellHeight = surfaceHeight / 3;
+    createGLTextures(surfaceWidth, cellHeight);
+}
+
+// Render content into a single backend texture
+static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool isItalic, const char* text) {
+    GrGLTextureInfo glInfo;
+    glInfo.fTarget = GL_TEXTURE_2D;
+    glInfo.fID = texId;
+    glInfo.fFormat = GL_RGBA8;
+
+    auto backendTex = GrBackendTextures::MakeGL(w, h, skgpu::Mipmapped::kNo, glInfo);
+
+    // Matching Android HWUI text gamma & contrast:
+    // Android HWUI uses text gamma ~1.4 for black text on white background and kUnknown pixel geometry
+    SkSurfaceProps surfaceProps(0, kUnknown_SkPixelGeometry, 0.0f, 1.4f);
+
+    sk_sp<SkSurface> cellSurface = SkSurfaces::WrapBackendTexture(
+            grContext.get(),
+            backendTex,
+            kTopLeft_GrSurfaceOrigin,
+            0, // sampleCnt
+            kRGBA_8888_SkColorType,
+            SkColorSpace::MakeSRGB(),
+            &surfaceProps);
+
+    if (!cellSurface) {
+        LOGE("Failed to wrap backend texture %u", texId);
+        return;
+    }
+
+    SkCanvas* canvas = cellSurface->getCanvas();
+
+    // 1. Draw cell background (matching cell_border.xml #F8F9FA)
+    canvas->clear(SkColorSetRGB(248, 249, 250));
+
+    // 2. Draw cell border (1px #CCCCCC)
+    SkPaint borderPaint;
+    borderPaint.setStyle(SkPaint::kStroke_Style);
+    borderPaint.setColor(SkColorSetRGB(204, 204, 204));
+    borderPaint.setStrokeWidth(2.0f);
+    canvas->drawRect(SkRect::MakeWH(w, h), borderPaint);
+
+    // 3. Resolve base typeface matching "sans-serif" Normal (Weight 400) - exactly what TextView uses
+    static sk_sp<SkFontMgr> androidFontMgr = nullptr;
+    if (!androidFontMgr) {
+        androidFontMgr = SkFontMgr_New_Android(nullptr);
+        if (!androidFontMgr) {
+            androidFontMgr = SkFontMgr_New_Custom_Directory("/system/fonts");
+        }
+    }
+
+    sk_sp<SkTypeface> typeface;
+    if (androidFontMgr) {
+        typeface = androidFontMgr->matchFamilyStyle("sans-serif", SkFontStyle::Normal());
+        if (!typeface) {
+            typeface = androidFontMgr->matchFamilyStyle(nullptr, SkFontStyle::Normal());
+        }
+    }
+
+    SkString familyName("Unknown");
+    SkString psName("Unknown");
+    if (typeface) {
+        typeface->getFamilyName(&familyName);
+        typeface->getPostScriptName(&psName);
+        LOGI("[Skia Cell texId=%u] Base font: Family='%s', PostScript='%s', isBold=%b, isItalic=%b",
+             texId, familyName.c_str(), psName.c_str(), isBold, isItalic);
+    } else {
+        LOGE("[Skia Cell texId=%u] Typeface is NULL!", texId);
+    }
+
+    // Use exact pixel size measured directly from Android TextView
+    SkFont font(typeface, globalTextSizePx);
+    // Use Greyscale Anti-Aliasing (same as Android mobile OLED screens)
+    font.setEdging(SkFont::Edging::kAntiAlias);
+    font.setSubpixel(true);
+
+    // Option A: Match Android TextView's paint.setFakeBoldText(true)
+    if (isBold) {
+        font.setEmbolden(true);
+    }
+
+    // Match Android TextView's paint.setTextSkewX(-0.25f)
+    if (isItalic) {
+        font.setSkewX(-0.25f);
+    }
+
+    SkPaint textPaint;
+    textPaint.setColor(SkColorSetRGB(25, 118, 210)); // #1976D2 matching left column
+    textPaint.setAntiAlias(true);
+
+    // Measure and center text horizontally & vertically exactly like Android TextView
+    SkFontMetrics metrics;
+    font.getMetrics(&metrics);
+
+    SkRect bounds;
+    SkScalar textWidth = font.measureText(text, strlen(text), SkTextEncoding::kUTF8, &bounds);
+
+    // Horizontal centering:
+    SkScalar x = (w - textWidth) / 2.0f;
+
+    // Vertical centering: Android TextView aligns text based on font metrics:
+    // Middle of font line is (ascent + descent) / 2.
+    // To center vertically in box of height h: baseline = h/2 - (ascent + descent)/2
+    SkScalar y = (h / 2.0f) - ((metrics.fAscent + metrics.fDescent) / 2.0f);
+
+    canvas->drawString(text, x, y, font, textPaint);
+
+    // Flush commands to the texture
+    grContext->flushAndSubmit();
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_helloskia_MainActivity_nativeRender(JNIEnv*, jobject) {
-    if (!skSurface) return;
-    SkCanvas* canvas = skSurface->getCanvas();
+    if (!mainSurface || !grContext) return;
 
-    canvas->clear(SK_ColorWHITE);
+    int cellW = texWidth;
+    int cellH = texHeight;
 
-    SkPaint paint;
-    paint.setColor(SK_ColorGREEN);
-    canvas->drawCircle(200, 200, 100, paint);
+    // --- BƯỚC 1: Render 3 nội dung vào 3 OpenGL Textures matching TextView ---
+    // Texture 0: Normal (isBold=false, isItalic=false)
+    renderCellToTexture(glTextureIds[0], cellW, cellH, false, false, "Hello");
 
-    paint.setAntiAlias(true);
-    paint.setColor(SK_ColorBLUE);
+    // Texture 1: Bold (isBold=true, isItalic=false)
+    renderCellToTexture(glTextureIds[1], cellW, cellH, true, false, "Hello");
 
-    auto data = SkData::MakeFromFileName("/system/fonts/Roboto-Regular.ttf");
-    if (!data) {
-        LOGE("Failed to load font file");
-        return;
+    // Texture 2: Bold Italic (isBold=true, isItalic=true)
+    renderCellToTexture(glTextureIds[2], cellW, cellH, true, true, "Hello");
+
+    // --- BƯỚC 2: Render thẳng 3 Texture lên Main Canvas ---
+    SkCanvas* mainCanvas = mainSurface->getCanvas();
+    mainCanvas->clear(SK_ColorWHITE);
+
+    for (int i = 0; i < 3; ++i) {
+        GrGLTextureInfo glInfo;
+        glInfo.fTarget = GL_TEXTURE_2D;
+        glInfo.fID = glTextureIds[i];
+        glInfo.fFormat = GL_RGBA8;
+
+        auto backendTex = GrBackendTextures::MakeGL(cellW, cellH, skgpu::Mipmapped::kNo, glInfo);
+
+        // BorrowTextureFrom: Zero-copy GPU texture handle wrapper (no CPU readback)
+        sk_sp<SkImage> textureImage = SkImages::BorrowTextureFrom(
+                grContext.get(),
+                backendTex,
+                kTopLeft_GrSurfaceOrigin,
+                kRGBA_8888_SkColorType,
+                kPremul_SkAlphaType,
+                SkColorSpace::MakeSRGB());
+
+        if (textureImage) {
+            float yPos = static_cast<float>(i * cellH);
+            mainCanvas->drawImage(textureImage, 0.0f, yPos);
+        } else {
+            LOGE("Failed to borrow texture %u", glTextureIds[i]);
+        }
     }
-
-
-    sk_sp<SkFontMgr> fontMgr = SkFontMgr_New_Custom_Directory("/system/fonts");
-    sk_sp<SkTypeface> typeface = fontMgr->matchFamilyStyle("Roboto", SkFontStyle());
-
-    SkFont font(typeface, 50);
-
-    canvas->drawString("Hello anh An béo by Skia", 100, 400, font, paint);
 
     grContext->flushAndSubmit();
     eglSwapBuffers(eglDisplay, eglSurface);
@@ -242,7 +373,9 @@ Java_com_example_helloskia_MainActivity_nativeRender(JNIEnv*, jobject) {
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_helloskia_MainActivity_nativeDestroy(JNIEnv*, jobject) {
-    skSurface.reset();
+    cleanupGLTextures();
+
+    mainSurface.reset();
     grContext.reset();
 
     if (eglDisplay != EGL_NO_DISPLAY) {
