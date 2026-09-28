@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">HelloSkia</string>
-    <string name="sample_cell_text">Hello\n안녕하세요\n😀🎉🚀\nשלום</string>
+    <string name="sample_cell_text">Hello\n안녕하세요\n😀🎉🚀\nשלום\nمرحبا</string>
 </resources>

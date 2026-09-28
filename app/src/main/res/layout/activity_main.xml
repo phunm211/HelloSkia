@@ -64,7 +64,7 @@
                 android:gravity="center"
                 android:text="@string/sample_cell_text"
                 android:textColor="#1976D2"
-                android:textSize="28sp"
+                android:textSize="22sp"
                 android:textStyle="normal" />
 
             <!-- Row 2: Bold -->
@@ -78,7 +78,7 @@
                 android:gravity="center"
                 android:text="@string/sample_cell_text"
                 android:textColor="#1976D2"
-                android:textSize="28sp"
+                android:textSize="22sp"
                 android:textStyle="bold" />
 
             <!-- Row 3: Bold Italic -->
@@ -92,7 +92,7 @@
                 android:gravity="center"
                 android:text="@string/sample_cell_text"
                 android:textColor="#1976D2"
-                android:textSize="28sp"
+                android:textSize="22sp"
                 android:textStyle="bold|italic" />
         </LinearLayout>
 

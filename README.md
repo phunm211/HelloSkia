@@ -70,9 +70,16 @@ Dự án này thực hiện hiển thị so sánh trực quan theo thời gian t
 
 ---
 
-## 3. Cơ chế Dynamic Font Fallback (Korean, Emoji, Hebrew)
+## 3. Cơ chế Dynamic Font Fallback (Korean, Emoji, Hebrew & Arabic - RTL)
 
-Do một file font Latin cơ sở (`sans-serif` / `RobotoStatic-Regular`) không chứa ký tự tiếng Hàn, Emoji hay tiếng Do Thái, việc gọi `drawString` trực tiếp sẽ dẫn đến ký tự trống/tofu (`\uFFFD`).
+Do một file font Latin cơ sở (`sans-serif` / `RobotoStatic-Regular`) không chứa ký tự tiếng Hàn, Emoji, tiếng Do Thái hay tiếng Ả Rập, việc gọi `drawString` trực tiếp sẽ dẫn đến ký tự trống/tofu (`\uFFFD`).
+
+### Các ngôn ngữ kiểm thử trong mẫu:
+1. **Latin**: `Hello` (LTR)
+2. **Tiếng Hàn (Korean)**: `안녕하세요` (Hangul, CJK Fallback)
+3. **Emoji**: `😀🎉🚀` (Color Bitmap Fallback - CBDT/CBLC)
+4. **Tiếng Do Thái (Hebrew)**: `שלום` (RTL - Right-To-Left)
+5. **Tiếng Ả Rập (Arabic)**: `مرحبا` (RTL - Right-To-Left & Cursive Script)
 
 ### Cách triển khai trong Skia:
 1. **UTF-8 Streaming Parser**:
@@ -85,13 +92,14 @@ Do một file font Latin cơ sở (`sans-serif` / `RobotoStatic-Regular`) không
        * Tự động tìm thấy và nạp đúng font file hỗ trợ codepoint `u` tại runtime:
          * Tiếng Hàn $\rightarrow$ `SamsungKorean-Regular.ttf` / `SECCJK-Regular.ttc`
          * Emoji $\rightarrow$ `NotoColorEmoji.ttf`
-         * Tiếng Do Thái $\rightarrow$ `NotoSansHebrew-Regular.ttf`
+         * Tiếng Do Thái (Hebrew - RTL) $\rightarrow$ `NotoSansHebrew-Regular.ttf`
+         * Tiếng Ả Rập (Arabic - RTL) $\rightarrow$ `SECNaskhArabic-Regular.ttf` / `NotoNaskhArabic-Regular.ttf`
 3. **Phân nhóm Run trong `SkTextBlob`**:
    * Gom các ký tự liên tiếp có cùng `SkTypeface` vào từng run của `SkTextBlobBuilder`.
    * Tính toán khoảng cách tọa độ `pos` chính xác dựa trên `font.getWidths`.
-4. **Xử lý tránh hiện tượng Double Bold (Chữ Hàn & Hebrew bị quá đậm)**:
+4. **Xử lý tránh hiện tượng Double Bold (Chữ Hàn, Hebrew, Arabic bị quá đậm)**:
    * Khi gọi `matchFamilyStyleCharacter` với `style = Bold`, Android Font Manager sẽ tìm và trả về file font **chính chủ Bold** (ví dụ: `NotoSansHebrew-Bold.ttf`, `SamsungKorean-Bold.ttf`).
-   * Nếu Skia tiếp tục áp dụng thêm stroke giả lập bold (`textPaint.setStrokeWidth`) lên một font vốn đã là file Bold thật, glyph sẽ bị cộng dồn 2 lần độ dày (**Double Bold**), khiến chữ tiếng Hàn và Hebrew đậm gấp đôi so với TextView.
+   * Nếu Skia tiếp tục áp dụng thêm stroke giả lập bold (`textPaint.setStrokeWidth`) lên một font vốn đã là file Bold thật, glyph sẽ bị cộng dồn 2 lần độ dày (**Double Bold**), khiến chữ fallback đậm gấp đôi so với TextView.
    * **Cách xử lý**:
      * Luôn truy vấn fallback font với `SkFontStyle::Normal()`.
      * Kiểm tra `tf->isBold()`: Nếu font trả về đã là bold tự thân thì không stroke thêm, nếu là font regular thì mới áp dụng stroke fake bold của TextView.
@@ -106,10 +114,10 @@ Do một file font Latin cơ sở (`sans-serif` / `RobotoStatic-Regular`) không
 
 ## 4. Danh sách các file được cập nhật
 
-* [`app/src/main/res/values/strings.xml`](file:///home/phu/Repo/HelloSkia/app/src/main/res/values/strings.xml): Thêm chuỗi mẫu 4 dòng đa ngôn ngữ `sample_cell_text`.
-* [`app/src/main/res/layout/activity_main.xml`](file:///home/phu/Repo/HelloSkia/app/src/main/res/layout/activity_main.xml): Gán `@string/sample_cell_text`, điều chỉnh kích thước về `28sp` để hiển thị vừa vặn 4 dòng.
+* [`app/src/main/res/values/strings.xml`](file:///home/phu/Repo/HelloSkia/app/src/main/res/values/strings.xml): Thêm chuỗi mẫu 5 dòng đa ngôn ngữ `sample_cell_text` (bao gồm Hebrew và Arabic).
+* [`app/src/main/res/layout/activity_main.xml`](file:///home/phu/Repo/HelloSkia/app/src/main/res/layout/activity_main.xml): Gán `@string/sample_cell_text`, điều chỉnh kích thước về `22sp` để hiển thị vừa vặn 5 dòng trong từng ô.
 * [`app/src/main/cpp/native_renderer.cpp`](file:///home/phu/Repo/HelloSkia/app/src/main/cpp/native_renderer.cpp):
   * Cấu hình `SkFontHinting::kNone` và `setLinearMetrics(true)`.
   * Áp dụng công thức stroke fake bold `strokeWidth = textSize / 30.0f`.
   * Bộ giải mã UTF-8 và thuật toán Fallback Font + Run clustering qua `SkTextBlobBuilder`.
-  * Bộ căn chỉnh đa dòng theo `SkFontMetrics`.
+  * Bộ căn chỉnh đa dòng theo `SkFontMetrics` cho 5 dòng chữ.

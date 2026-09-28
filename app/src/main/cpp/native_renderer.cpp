@@ -533,7 +533,7 @@ Java_com_example_helloskia_MainActivity_nativeRender(JNIEnv*, jobject) {
     int cellW = texWidth;
     int cellH = texHeight;
 
-    const char* sampleText = "Hello\n안녕하세요\n😀🎉🚀\nשלום";
+    const char* sampleText = "Hello\n안녕하세요\n😀🎉🚀\nשלום\nمرحبا";
 
     // --- BƯỚC 1: Render 3 nội dung vào 3 OpenGL Textures matching TextView ---
     // Texture 0: Normal (isBold=false, isItalic=false)
