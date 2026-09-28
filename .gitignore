@@ -13,4 +13,7 @@
 .externalNativeBuild
 .cxx
 local.properties
-app/src/main/cpp/skia/out/
+app/src/main/cpp/skia/out/*
+!app/src/main/cpp/skia/out/Debug-android-arm64/
+app/src/main/cpp/skia/out/Debug-android-arm64/*
+!app/src/main/cpp/skia/out/Debug-android-arm64/*.a
