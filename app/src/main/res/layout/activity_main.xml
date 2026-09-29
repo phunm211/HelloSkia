@@ -60,11 +60,11 @@
                 android:layout_height="0dp"
                 android:layout_weight="1"
                 android:background="@drawable/cell_border"
-                android:fontFamily="sans-serif"
+                android:fontFamily="sec"
                 android:gravity="center"
                 android:text="@string/sample_cell_text"
                 android:textColor="#1976D2"
-                android:textSize="22sp"
+                android:textSize="38sp"
                 android:textStyle="normal" />
 
             <!-- Row 2: Bold -->
@@ -74,11 +74,11 @@
                 android:layout_height="0dp"
                 android:layout_weight="1"
                 android:background="@drawable/cell_border"
-                android:fontFamily="sans-serif"
+                android:fontFamily="sec"
                 android:gravity="center"
                 android:text="@string/sample_cell_text"
                 android:textColor="#1976D2"
-                android:textSize="22sp"
+                android:textSize="38sp"
                 android:textStyle="bold" />
 
             <!-- Row 3: Bold Italic -->
@@ -88,11 +88,11 @@
                 android:layout_height="0dp"
                 android:layout_weight="1"
                 android:background="@drawable/cell_border"
-                android:fontFamily="sans-serif"
+                android:fontFamily="sec"
                 android:gravity="center"
                 android:text="@string/sample_cell_text"
                 android:textColor="#1976D2"
-                android:textSize="22sp"
+                android:textSize="38sp"
                 android:textStyle="bold|italic" />
         </LinearLayout>
 

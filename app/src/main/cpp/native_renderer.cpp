@@ -1,12 +1,23 @@
 #include <jni.h>
 #include <android/native_window_jni.h>
 #include <android/log.h>
+#include <android/font.h>
+#include <android/font_matcher.h>
 #include <EGL/egl.h>
 #include <GLES3/gl32.h>
 
-#include "include/ports/SkFontMgr_directory.h"
-#include "include/ports/SkFontMgr_android.h"
+#include <vector>
+#include <string>
+#include <sstream>
+#include <unordered_map>
+#include <memory>
+
+#include "modules/skshaper/include/SkShaper.h"
+#include "modules/skshaper/include/SkShaper_harfbuzz.h"
+#include "modules/skunicode/include/SkUnicode_icu.h"
+#include "include/ports/SkFontMgr_empty.h"
 #include "include/core/SkFontMgr.h"
+#include "include/core/SkStream.h"
 #include "include/core/SkTypeface.h"
 #include "include/core/SkSurface.h"
 #include "include/core/SkColorSpace.h"
@@ -16,6 +27,9 @@
 #include "include/core/SkFontMetrics.h"
 #include "include/core/SkFontStyle.h"
 #include "include/core/SkSurfaceProps.h"
+#include "include/core/SkTextBlob.h"
+#include "include/core/SkColorFilter.h"
+#include "include/core/SkBlendMode.h"
 #include "include/gpu/ganesh/GrDirectContext.h"
 #include "include/gpu/ganesh/gl/GrGLInterface.h"
 #include "include/gpu/ganesh/gl/GrGLTypes.h"
@@ -212,14 +226,6 @@ Java_com_example_helloskia_MainActivity_nativeResize(JNIEnv*, jobject, jint widt
     int cellHeight = surfaceHeight / 3;
     createGLTextures(surfaceWidth, cellHeight);
 }
-
-#include <vector>
-#include <string>
-#include <sstream>
-#include "include/core/SkTextBlob.h"
-#include "include/core/SkColorFilter.h"
-#include "include/core/SkBlendMode.h"
-
 // Helper to decode a single UTF-8 codepoint from a byte stream
 static SkUnichar nextUtf8Char(const char*& ptr, const char* end) {
     if (ptr >= end) return 0;
@@ -249,180 +255,225 @@ static SkUnichar nextUtf8Char(const char*& ptr, const char* end) {
     return c;
 }
 
-// Draw a single line with dynamic font fallback for Korean, Emoji, Hebrew, etc.
-static void drawLineWithFallback(SkCanvas* canvas, const std::string& line, SkScalar x, SkScalar y,
-                                 SkFontMgr* fontMgr, sk_sp<SkTypeface> baseTypeface,
-                                 SkScalar textSize, bool isBold, bool isItalic, const SkPaint& textPaint) {
-    if (line.empty()) return;
+// Global cache for Typefaces resolved via AFontMatcher file paths to prevent redundant re-reading
+static std::unordered_map<std::string, sk_sp<SkTypeface>> gFontCache;
+static AFontMatcher* gFontMatcher = nullptr;
 
-    struct GlyphItem {
-        sk_sp<SkTypeface> typeface;
-        SkGlyphID glyphId;
-        SkScalar advance;
+static sk_sp<SkFontMgr> getEmptyFontMgr() {
+    static sk_sp<SkFontMgr> mgr = SkFontMgr_New_Custom_Empty();
+    return mgr;
+}
+
+static AFontMatcher* getFontMatcher() {
+    if (!gFontMatcher) {
+        gFontMatcher = AFontMatcher_create();
+    }
+    return gFontMatcher;
+}
+
+// Convert UTF-8 to UTF-16 for AFontMatcher_match
+static std::vector<uint16_t> utf8ToUtf16(const char* utf8, size_t utf8Bytes) {
+    std::vector<uint16_t> utf16;
+    const char* ptr = utf8;
+    const char* end = utf8 + utf8Bytes;
+    while (ptr < end) {
+        SkUnichar u = nextUtf8Char(ptr, end);
+        if (u == 0) break;
+        if (u <= 0xFFFF) {
+            utf16.push_back((uint16_t)u);
+        } else {
+            u -= 0x10000;
+            utf16.push_back((uint16_t)((u >> 10) + 0xD800));
+            utf16.push_back((uint16_t)((u & 0x3FF) + 0xDC00));
+        }
+    }
+    return utf16;
+}
+
+static sk_sp<SkTypeface> createWeightTypeface(sk_sp<SkTypeface> tf, float weight) {
+    if (!tf) return nullptr;
+    SkFontArguments::VariationPosition::Coordinate coord = {
+        SkSetFourByteTag('w', 'g', 'h', 't'), weight
     };
+    SkFontArguments args;
+    args.setVariationDesignPosition({ &coord, 1 });
+    auto cloned = tf->makeClone(args);
+    return cloned ? cloned : tf;
+}
 
-    std::vector<GlyphItem> glyphs;
-    const char* ptr = line.data();
-    const char* end = ptr + line.size();
+// Custom FontRunIterator that resolves fonts using Android NDK's AFontMatcher
+class AFontMatcherRunIterator : public SkShaper::FontRunIterator {
+public:
+    AFontMatcherRunIterator(const char* utf8, size_t utf8Bytes, SkScalar textSize, bool isBold, bool isItalic,
+                            sk_sp<SkTypeface> baseTypeface)
+            : fUtf8(utf8), fUtf8Bytes(utf8Bytes), fTextSize(textSize), fIsBold(isBold), fIsItalic(isItalic),
+              fBaseTypeface(baseTypeface), fCurrentOffset(0) {
+        consume();
+    }
 
-    // Cache recently resolved typefaces to minimize SkFontMgr queries
-    sk_sp<SkTypeface> lastTf = baseTypeface;
-
-    SkFontStyle targetStyle = isBold ? (isItalic ? SkFontStyle::BoldItalic() : SkFontStyle::Bold())
-                                     : (isItalic ? SkFontStyle::Italic() : SkFontStyle::Normal());
-
-    while (ptr < end) {
-        SkUnichar u = nextUtf8Char(ptr, end);
-        if (u == 0) break;
-
-        sk_sp<SkTypeface> matchedTf;
-        SkGlyphID gid = 0;
-
-        // 1. Try base typeface first
-        if (baseTypeface) {
-            gid = baseTypeface->unicharToGlyph(u);
-            if (gid != 0) {
-                matchedTf = baseTypeface;
-            }
+    void consume() override {
+        if (fCurrentOffset >= fUtf8Bytes) {
+            return;
         }
 
-        // 2. Try last matched fallback typeface
-        if (gid == 0 && lastTf && lastTf != baseTypeface) {
-            gid = lastTf->unicharToGlyph(u);
-            if (gid != 0) {
-                matchedTf = lastTf;
+        const char* textStart = fUtf8 + fCurrentOffset;
+        size_t remainingBytes = fUtf8Bytes - fCurrentOffset;
+
+        // Check first codepoint
+        const char* tempPtr = textStart;
+        SkUnichar firstChar = nextUtf8Char(tempPtr, textStart + remainingBytes);
+        size_t firstCharBytes = tempPtr - textStart;
+
+        // If baseTypeface has the glyph, consume all consecutive characters supported by baseTypeface
+        if (fBaseTypeface && fBaseTypeface->unicharToGlyph(firstChar) != 0) {
+            setupFont(fBaseTypeface);
+            const char* walk = tempPtr;
+            while (walk < textStart + remainingBytes) {
+                const char* prev = walk;
+                SkUnichar u = nextUtf8Char(walk, textStart + remainingBytes);
+                if (u == 0 || fBaseTypeface->unicharToGlyph(u) == 0) {
+                    walk = prev;
+                    break;
+                }
             }
+            fCurrentOffset = walk - fUtf8;
+            return;
         }
 
-        // 3. Query system fallback font manager for this specific codepoint
-        // Note: Use SkFontStyle::Normal() so we resolve the base fallback font (e.g. Regular),
-        // exactly matching how TextView handles fallback fonts with fakeBold.
-        if (gid == 0 && fontMgr) {
-            matchedTf = fontMgr->matchFamilyStyleCharacter("sans-serif", SkFontStyle::Normal(), nullptr, 0, u);
-            if (matchedTf) {
-                gid = matchedTf->unicharToGlyph(u);
+        // Otherwise, use AFontMatcher to discover font from Android OS
+        std::vector<uint16_t> utf16 = utf8ToUtf16(textStart, remainingBytes);
+        AFontMatcher* matcher = getFontMatcher();
+        AFontMatcher_setStyle(matcher, fIsBold ? 700 : 400, fIsItalic);
+        uint32_t runLengthUtf16 = 0;
+        AFont* font = AFontMatcher_match(matcher, "sec", utf16.data(), (uint32_t)utf16.size(), &runLengthUtf16);
+
+        sk_sp<SkTypeface> matchedTf = nullptr;
+        if (font) {
+            const char* path = AFont_getFontFilePath(font);
+            if (path) {
+                int ttcIndex = (int)AFont_getCollectionIndex(font);
+                size_t axisCount = AFont_getAxisCount(font);
+                std::string cacheKey = std::string(path) + "_" + std::to_string(ttcIndex) + "_" + (fIsBold ? "B" : "N") + "_" + (fIsItalic ? "I" : "N");
+                auto it = gFontCache.find(cacheKey);
+                if (it != gFontCache.end()) {
+                    matchedTf = it->second;
+                } else {
+                    SkFontArguments args;
+                    args.setCollectionIndex(ttcIndex);
+                    std::vector<SkFontArguments::VariationPosition::Coordinate> coords;
+                    if (axisCount > 0) {
+                        coords.resize(axisCount);
+                        for (size_t i = 0; i < axisCount; ++i) {
+                            coords[i].axis = AFont_getAxisTag(font, i);
+                            coords[i].value = AFont_getAxisValue(font, i);
+                        }
+                        args.setVariationDesignPosition({ coords.data(), (int)coords.size() });
+                    }
+                    std::unique_ptr<SkStreamAsset> stream = SkStream::MakeFromFile(path);
+                    if (stream) {
+                        matchedTf = getEmptyFontMgr()->makeFromStream(std::move(stream), args);
+                    }
+                    if (!matchedTf) {
+                        matchedTf = getEmptyFontMgr()->makeFromFile(path, ttcIndex);
+                    }
+                    if (matchedTf) {
+                        gFontCache[cacheKey] = matchedTf;
+                    }
+                }
             }
+            AFont_close(font);
         }
 
-        // Fallback to base if still 0
         if (!matchedTf) {
-            matchedTf = baseTypeface;
-        }
-        lastTf = matchedTf;
-
-        SkFont subFont(matchedTf, textSize);
-        subFont.setEdging(SkFont::Edging::kAntiAlias);
-        subFont.setSubpixel(true);
-        subFont.setHinting(SkFontHinting::kNone);
-        subFont.setLinearMetrics(true);
-        if (isItalic) subFont.setSkewX(-0.25f);
-
-        SkScalar width = 0;
-        // Measure with fake bold stroke width if applicable
-        if (isBold && !matchedTf->isBold()) {
-            subFont.getWidthsBounds(&gid, 1, &width, nullptr, &textPaint);
-        } else {
-            subFont.getWidths(&gid, 1, &width);
+            matchedTf = fBaseTypeface;
         }
 
-        glyphs.push_back({matchedTf, gid, width});
+        setupFont(matchedTf);
+
+        // Convert runLengthUtf16 back to UTF-8 byte count
+        size_t consumedUtf8Bytes = 0;
+        const char* walk = textStart;
+        uint32_t walkedUtf16 = 0;
+        while (walk < textStart + remainingBytes && walkedUtf16 < runLengthUtf16) {
+            SkUnichar u = nextUtf8Char(walk, textStart + remainingBytes);
+            if (u == 0) break;
+            walkedUtf16 += (u > 0xFFFF) ? 2 : 1;
+        }
+        consumedUtf8Bytes = walk - textStart;
+        if (consumedUtf8Bytes == 0) {
+            consumedUtf8Bytes = firstCharBytes > 0 ? firstCharBytes : 1;
+        }
+        fCurrentOffset += consumedUtf8Bytes;
     }
 
-    // Now group consecutive glyphs with the same typeface into SkTextBlob runs
-    SkScalar currX = x;
-    size_t i = 0;
-    while (i < glyphs.size()) {
-        sk_sp<SkTypeface> tf = glyphs[i].typeface;
-        size_t runStart = i;
-        while (i < glyphs.size() && glyphs[i].typeface == tf) {
-            i++;
-        }
-        int count = static_cast<int>(i - runStart);
+    size_t endOfCurrentRun() const override {
+        return fCurrentOffset;
+    }
 
-        SkFont runFont(tf, textSize);
-        runFont.setEdging(SkFont::Edging::kAntiAlias);
-        runFont.setSubpixel(true);
-        runFont.setHinting(SkFontHinting::kNone);
-        runFont.setLinearMetrics(true);
-        if (isItalic) runFont.setSkewX(-0.25f);
+    bool atEnd() const override {
+        return fCurrentOffset >= fUtf8Bytes;
+    }
 
-        SkTextBlobBuilder builder;
-        const auto& runBuffer = builder.allocRunPosH(runFont, count, 0.0f);
+    const SkFont& currentFont() const override {
+        return fCurrentFont;
+    }
 
-        SkScalar runStartX = currX;
-        for (int k = 0; k < count; ++k) {
-            runBuffer.glyphs[k] = glyphs[runStart + k].glyphId;
-            runBuffer.pos[k] = currX - runStartX;
-            currX += glyphs[runStart + k].advance;
-        }
-
-        sk_sp<SkTextBlob> blob = builder.make();
-        if (blob) {
-            // Check if this font is a color emoji font (e.g. NotoColorEmoji)
-            SkString familyName;
-            if (tf) tf->getFamilyName(&familyName);
-            bool isEmoji = (strstr(familyName.c_str(), "Emoji") != nullptr);
-
-            if (isEmoji) {
-                // Emoji fonts are multicolored bitmaps; draw with pure color-filterless paint
-                SkPaint emojiPaint;
-                emojiPaint.setAntiAlias(true);
-                canvas->drawTextBlob(blob, runStartX, y, emojiPaint);
-            } else if (tf && tf->isBold()) {
-                // If the font is already intrinsically bold, draw with normal fill to prevent double bolding
-                SkPaint normalPaint;
-                normalPaint.setColor(textPaint.getColor());
-                normalPaint.setAntiAlias(true);
-                canvas->drawTextBlob(blob, runStartX, y, normalPaint);
-            } else {
-                canvas->drawTextBlob(blob, runStartX, y, textPaint);
-            }
+private:
+    void setupFont(sk_sp<SkTypeface> tf) {
+        fCurrentFont = SkFont(tf, fTextSize);
+        fCurrentFont.setEdging(SkFont::Edging::kAntiAlias);
+        fCurrentFont.setSubpixel(true);
+        fCurrentFont.setHinting(SkFontHinting::kNone);
+        fCurrentFont.setLinearMetrics(true);
+        if (fIsItalic) {
+            fCurrentFont.setSkewX(-0.25f);
         }
     }
-}
 
-// Measure width of a single line using font fallback
-static SkScalar measureLineWidth(const std::string& line, SkFontMgr* fontMgr,
-                                 sk_sp<SkTypeface> baseTypeface, SkScalar textSize,
-                                 bool isBold, const SkPaint& textPaint) {
-    if (line.empty()) return 0.0f;
-    const char* ptr = line.data();
-    const char* end = ptr + line.size();
-    SkScalar totalW = 0.0f;
-    sk_sp<SkTypeface> lastTf = baseTypeface;
+    const char* fUtf8;
+    size_t fUtf8Bytes;
+    SkScalar fTextSize;
+    bool fIsBold;
+    bool fIsItalic;
+    sk_sp<SkTypeface> fBaseTypeface;
+    size_t fCurrentOffset;
+    SkFont fCurrentFont;
+};
 
-    while (ptr < end) {
-        SkUnichar u = nextUtf8Char(ptr, end);
-        if (u == 0) break;
+// Custom RunHandler that wraps SkTextBlobBuilderRunHandler and records total line advance
+class CenteringRunHandler : public SkShaper::RunHandler {
+public:
+    CenteringRunHandler(const char* utf8Text, SkPoint offset)
+        : fInner(utf8Text, offset), fTotalAdvanceX(0.0f) {}
 
-        sk_sp<SkTypeface> matchedTf;
-        SkGlyphID gid = 0;
-        if (baseTypeface) {
-            gid = baseTypeface->unicharToGlyph(u);
-            if (gid != 0) matchedTf = baseTypeface;
-        }
-        if (gid == 0 && lastTf && lastTf != baseTypeface) {
-            gid = lastTf->unicharToGlyph(u);
-            if (gid != 0) matchedTf = lastTf;
-        }
-        if (gid == 0 && fontMgr) {
-            matchedTf = fontMgr->matchFamilyStyleCharacter("sans-serif", SkFontStyle::Normal(), nullptr, 0, u);
-            if (matchedTf) gid = matchedTf->unicharToGlyph(u);
-        }
-        if (!matchedTf) matchedTf = baseTypeface;
-        lastTf = matchedTf;
-
-        SkFont subFont(matchedTf, textSize);
-        SkScalar width = 0;
-        if (isBold && !matchedTf->isBold()) {
-            subFont.getWidthsBounds(&gid, 1, &width, nullptr, &textPaint);
-        } else {
-            subFont.getWidths(&gid, 1, &width);
-        }
-        totalW += width;
+    void beginLine() override {
+        fInner.beginLine();
+        fTotalAdvanceX = 0.0f;
     }
-    return totalW;
-}
+    void runInfo(const RunInfo& info) override {
+        fInner.runInfo(info);
+        fTotalAdvanceX += info.fAdvance.fX;
+    }
+    void commitRunInfo() override {
+        fInner.commitRunInfo();
+    }
+    Buffer runBuffer(const RunInfo& info) override {
+        return fInner.runBuffer(info);
+    }
+    void commitRunBuffer(const RunInfo& info) override {
+        fInner.commitRunBuffer(info);
+    }
+    void commitLine() override {
+        fInner.commitLine();
+    }
+
+    sk_sp<SkTextBlob> makeBlob() { return fInner.makeBlob(); }
+    SkScalar width() const { return fTotalAdvanceX; }
+
+private:
+    SkTextBlobBuilderRunHandler fInner;
+    SkScalar fTotalAdvanceX;
+};
 
 // Render content into a single backend texture
 static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool isItalic, const char* text) {
@@ -462,34 +513,37 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
     borderPaint.setStrokeWidth(2.0f);
     canvas->drawRect(SkRect::MakeWH(w, h), borderPaint);
 
-    // 3. Resolve base typeface matching "sans-serif" Normal (Weight 400)
-    static sk_sp<SkFontMgr> androidFontMgr = nullptr;
-    if (!androidFontMgr) {
-        androidFontMgr = SkFontMgr_New_Android(nullptr);
-        if (!androidFontMgr) {
-            androidFontMgr = SkFontMgr_New_Custom_Directory("/system/fonts");
+    // 3. Sử dụng SkFontMgr_New_Custom_Empty() thay cho SkFontMgr_New_Android
+    sk_sp<SkFontMgr> emptyFontMgr = getEmptyFontMgr();
+
+    // Load base typeface: prioritize OneUISans-VF.ttf on Samsung devices, fallback to Roboto
+    static sk_sp<SkTypeface> baseTypefaceRegular = nullptr;
+    static sk_sp<SkTypeface> baseTypefaceBold = nullptr;
+    if (!baseTypefaceRegular) {
+        baseTypefaceRegular = emptyFontMgr->makeFromFile("/system/fonts/OneUISans-VF.ttf");
+        if (!baseTypefaceRegular) {
+            baseTypefaceRegular = emptyFontMgr->makeFromFile("/system/fonts/RobotoStatic-Regular.ttf");
+        }
+        if (!baseTypefaceRegular) {
+            baseTypefaceRegular = emptyFontMgr->makeFromFile("/system/fonts/Roboto-Regular.ttf");
+        }
+        if (baseTypefaceRegular) {
+            baseTypefaceBold = createWeightTypeface(baseTypefaceRegular, 700.0f);
         }
     }
 
-    sk_sp<SkTypeface> typeface;
-    if (androidFontMgr) {
-        typeface = androidFontMgr->matchFamilyStyle("sans-serif", SkFontStyle::Normal());
-        if (!typeface) {
-            typeface = androidFontMgr->matchFamilyStyle(nullptr, SkFontStyle::Normal());
-        }
+    sk_sp<SkTypeface> curBaseTypeface = (isBold && baseTypefaceBold) ? baseTypefaceBold : baseTypefaceRegular;
+
+    // 4. Khởi tạo SkShaper (HarfBuzz) và SkUnicode (ICU)
+    static std::unique_ptr<SkShaper> shaper = nullptr;
+    if (!shaper) {
+        shaper = SkShaper::Make(emptyFontMgr);
     }
 
     SkPaint textPaint;
     textPaint.setColor(SkColorSetRGB(25, 118, 210)); // #1976D2 matching left column
     textPaint.setAntiAlias(true);
-
-    // Option A: Android HWUI implements paint.setFakeBoldText(true) by applying stroke-and-fill
-    if (isBold) {
-        textPaint.setStyle(SkPaint::kStrokeAndFill_Style);
-        textPaint.setStrokeWidth(globalTextSizePx / 30.0f);
-        textPaint.setStrokeJoin(SkPaint::kRound_Join);
-        textPaint.setStrokeCap(SkPaint::kRound_Cap);
-    }
+    textPaint.setStyle(SkPaint::kFill_Style);
 
     // Split text into individual lines
     std::vector<std::string> lines;
@@ -499,27 +553,48 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
         lines.push_back(item);
     }
 
-    SkFont baseFont(typeface, globalTextSizePx);
+    SkFont baseFont(curBaseTypeface, globalTextSizePx);
     SkFontMetrics metrics;
     baseFont.getMetrics(&metrics);
 
-    // Line spacing matching Android TextView:
-    // Android TextView uses font.getFontSpacing() = descent - ascent + leading
     SkScalar lineHeight = metrics.fDescent - metrics.fAscent + metrics.fLeading;
     SkScalar totalTextBlockHeight = lines.size() * lineHeight;
-
-    // Start baseline y for vertical centering
-    SkScalar startBaselineY = (h - totalTextBlockHeight) / 2.0f - metrics.fAscent;
+    // Note: SkTextBlobBuilderRunHandler already offsets glyph baseline by maxRunAscent,
+    // so the blob origin (0, 0) is at the top of the line.
+    // Proportional compensation for Android TextView default includeFontPadding:
+    SkScalar fontPaddingOffset = globalTextSizePx * (4.0f / 46.75f);
+    SkScalar startY = (h - totalTextBlockHeight) / 2.0f + fontPaddingOffset;
 
     for (size_t lineIdx = 0; lineIdx < lines.size(); ++lineIdx) {
         const std::string& curLine = lines[lineIdx];
-        SkScalar lineWidth = measureLineWidth(curLine, androidFontMgr.get(), typeface, globalTextSizePx,
-                                              isBold, textPaint);
-        SkScalar x = (w - lineWidth) / 2.0f;
-        SkScalar y = startBaselineY + lineIdx * lineHeight;
+        if (curLine.empty()) continue;
 
-        drawLineWithFallback(canvas, curLine, x, y, androidFontMgr.get(), typeface,
-                             globalTextSizePx, isBold, isItalic, textPaint);
+        // Shape with HarfBuzz & AFontMatcher
+        AFontMatcherRunIterator fontIter(curLine.data(), curLine.size(), globalTextSizePx, isBold, isItalic, curBaseTypeface);
+        std::unique_ptr<SkShaper::BiDiRunIterator> bidiIter =
+                SkShaper::MakeBiDiRunIterator(curLine.data(), curLine.size(), 0);
+        std::unique_ptr<SkShaper::ScriptRunIterator> scriptIter =
+                SkShapers::HB::ScriptRunIterator(curLine.data(), curLine.size());
+        std::unique_ptr<SkShaper::LanguageRunIterator> langIter =
+                SkShaper::MakeStdLanguageRunIterator(curLine.data(), curLine.size());
+
+        CenteringRunHandler handler(curLine.c_str(), {0, 0});
+        if (bidiIter && scriptIter && langIter && shaper) {
+            shaper->shape(curLine.data(), curLine.size(),
+                          fontIter, *bidiIter, *scriptIter, *langIter,
+                          (SkScalar)w, &handler);
+        }
+
+        sk_sp<SkTextBlob> blob = handler.makeBlob();
+        SkScalar lineWidth = handler.width();
+
+        // Center horizontally per line: (w - lineWidth) / 2
+        SkScalar x = (w - lineWidth) / 2.0f;
+        SkScalar y = startY + lineIdx * lineHeight;
+
+        if (blob) {
+            canvas->drawTextBlob(blob, x, y, textPaint);
+        }
     }
 
     // Flush commands to the texture
