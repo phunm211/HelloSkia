@@ -33,12 +33,32 @@ public class MainActivity extends Activity {
         tvBold = findViewById(R.id.tvBold);
         tvBoldItalic = findViewById(R.id.tvBoldItalic);
 
-        android.graphics.Typeface tfBase = android.graphics.Typeface.create("sec", android.graphics.Typeface.NORMAL);
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
-            tvNormal.setTypeface(android.graphics.Typeface.create(tfBase, 400, false));
-            tvBold.setTypeface(android.graphics.Typeface.create(tfBase, 700, false));
-            tvBoldItalic.setTypeface(android.graphics.Typeface.create(tfBase, 700, true));
+            // Try "sec" family first (OneUISans on One UI 6+, SamsungOne on older)
+            android.graphics.Typeface tfBase = android.graphics.Typeface.create("sec", android.graphics.Typeface.NORMAL);
+            android.graphics.Typeface tfBoldCandidate = android.graphics.Typeface.create(tfBase, 700, false);
+
+            // Detect if weight axis actually worked: if weight is still 400, the font
+            // is a static font (no wght axis) and bold won't render correctly via axis.
+            // Fallback to system default in that case.
+            boolean secHasWeightAxis = (tfBoldCandidate.getWeight() >= 600);
+            android.util.Log.i("HelloSkia_Java", "[Font] 'sec' family weight axis available: " + secHasWeightAxis
+                    + " (reported bold weight=" + tfBoldCandidate.getWeight() + ")");
+
+            if (secHasWeightAxis) {
+                // One UI 6+ with OneUISans VF: weight axis works correctly
+                tvNormal.setTypeface(android.graphics.Typeface.create(tfBase, 400, false));
+                tvBold.setTypeface(tfBoldCandidate);
+                tvBoldItalic.setTypeface(android.graphics.Typeface.create(tfBase, 700, true));
+            } else {
+                // One UI 5.1 or earlier: "sec" is a static font, use system default
+                // which correctly handles bold via separate font file
+                tvNormal.setTypeface(android.graphics.Typeface.defaultFromStyle(android.graphics.Typeface.NORMAL));
+                tvBold.setTypeface(android.graphics.Typeface.defaultFromStyle(android.graphics.Typeface.BOLD));
+                tvBoldItalic.setTypeface(android.graphics.Typeface.defaultFromStyle(android.graphics.Typeface.BOLD_ITALIC));
+            }
         } else {
+            android.graphics.Typeface tfBase = android.graphics.Typeface.create("sec", android.graphics.Typeface.NORMAL);
             tvNormal.setTypeface(tfBase, android.graphics.Typeface.NORMAL);
             tvBold.setTypeface(tfBase, android.graphics.Typeface.BOLD);
             tvBoldItalic.setTypeface(tfBase, android.graphics.Typeface.BOLD_ITALIC);

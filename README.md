@@ -29,15 +29,19 @@ Dự án này thực hiện hiển thị so sánh trực quan theo thời gian t
 
 ---
 
-### 2.2. Vấn đề 2: Sai khác độ nở nét của Fake Bold (chữ "e" bị hẹp lỗ)
+### 2.2. Vấn đề 2: Sai khác độ nở nét của Fake Bold (chữ "e" bị hẹp lỗ) — **[ĐÃ THAY THẾ]**
+
+> ⚠️ **Phần này mô tả một giải pháp trung gian đã bị thay thế bởi Section 5 và Section 6.**
+> Giải pháp hiện tại không dùng Fake Bold hay Stroke-and-Fill cho trường hợp thông thường.
+
 * **Hiện tượng**: Dù cùng fake bold, chữ `e` của Skia bị nở dày hơn, khoảng trống bên trong (inner counter) bị bóp hẹp lại so với TextView.
 * **Nguyên nhân**:
   * Skia dùng `font.setEmbolden(true)`, bên dưới gọi FreeType `FT_GlyphSlot_Embolden` với tỉ lệ nở outline cố định là $\frac{1}{24} \approx 4.16\%$.
   * Trong khi đó, Android HWUI thực hiện fake bold bằng kỹ thuật Stroke-and-Fill:
     $$\text{strokeWidth} = \frac{\text{textSize}}{30.0f} \approx 3.33\%$$
     với `kRound_Join` và `kRound_Cap`.
-* **Cách khắc phục**:
-  * Thay thế `font.setEmbolden(true)` trong Skia bằng:
+* **Giải pháp trung gian (đã lỗi thời)**:
+  * Thay thế `font.setEmbolden(true)` bằng Stroke-and-Fill thủ công để khớp với HWUI:
     ```cpp
     if (isBold) {
         textPaint.setStyle(SkPaint::kStrokeAndFill_Style);
@@ -46,6 +50,11 @@ Dự án này thực hiện hiển thị so sánh trực quan theo thời gian t
         textPaint.setStrokeCap(SkPaint::kRound_Cap);
     }
     ```
+* **Giải pháp hiện tại (xem Section 5 & 6)**:
+  * Vấn đề gốc rễ là **bold typeface chưa được nạp đúng** ở tầng Java.
+  * Sau khi sửa Java dùng `Typeface.create("sec", 700, false)` → Android TextView nạp đúng `wght=700` từ OneUISans VF.
+  * Ở phía Skia C++: nạp `SkTypeface` với trục `wght=700` trực tiếp qua Variable Font axis — không cần Stroke-and-Fill.
+  * `SkFont::setEmbolden(true)` chỉ được dùng như fallback cuối cùng cho trường hợp đặc biệt: static font mà Regular và Bold trỏ về **cùng 1 file** (ví dụ: Samsung DroidSans trên G781V — xem Section 6).
 
 ---
 
@@ -179,4 +188,141 @@ Sau khi chuyển TextView sang sử dụng Samsung OneUI Sans, chữ `Hello` ở
 
 ![So sánh chữ e Bold phóng to 600%: Cấu trúc vòng cung, độ dày nét và khẩu độ mở ăn khớp từng pixel](docs/images/true_e_bold_zoomed_comparison.png)
 
+---
 
+## 6. Vấn đề Bold sai trên thiết bị không có OneUISans (One UI 5.1 — Samsung G781V)
+
+### 6.1. Bối cảnh
+
+Thiết bị **Samsung Galaxy S20 FE 5G (SM-G781V)** chạy **One UI 5.1 (Android 13, API 33)** không có file `OneUISans-VF.ttf`.
+Thay vào đó, người dùng đã cài font **Samsung Sans** thông qua hệ thống FlipFont của Samsung, font này nằm tại:
+
+```
+/data/app_fonts/0/Samsungsans/DroidSans.ttf
+```
+
+Đây là **static font** (không phải Variable Font) — **một file duy nhất** không có OpenType `wght` axis.
+
+---
+
+### 6.2. Hiện tượng
+
+Dòng Bold (hàng 2) bên Skia trông giống hệt dòng Regular (hàng 1) — không có bất kỳ sự khác biệt nào về độ đậm của nét chữ.
+
+---
+
+### 6.3. Chuỗi nguyên nhân (Root Cause Chain)
+
+#### Vấn đề A — Java side: `secHasWeightAxis` phát hiện sai
+
+`Typeface.create("sec", Typeface.NORMAL)` trên One UI 5.1 resolve thành **SamsungOne** (font hệ thống Samsung).
+`Typeface.create(tfBase, 700, false).getWeight()` trả về `700` do Android **fake bold**, không phải do variable axis thực.
+→ Code Java kết luận `secHasWeightAxis = true` và dùng weight axis — **nhưng trên thực tế font không có axis**.
+
+#### Vấn đề B — C++ side: `AFontMatcher` trả về cùng file cho Regular và Bold
+
+```
+AFontMatcher_match("sec", weight=400) → /data/app_fonts/.../DroidSans.ttf  (axes=0)
+AFontMatcher_match("sec", weight=700) → /data/app_fonts/.../DroidSans.ttf  (axes=0)
+                                         ↑ CÙNG FILE, CÙNG PATH
+```
+
+Code cũ chỉ kiểm tra `-VF` trong tên file và `axisCount > 0` để phân biệt VF/static.
+Khi cả hai đều false → rơi vào nhánh `load separate bold file` nhưng lại load cùng file với Regular.
+→ Skia render cùng typeface cho cả Regular lẫn Bold → **không có sự phân biệt**.
+
+---
+
+### 6.4. Giải pháp: Hệ thống phát hiện Bold 3 chiến lược
+
+Thêm bước kiểm tra: **so sánh đường dẫn file** trả về từ `AFontMatcher` ở weight=400 và weight=700.
+
+```
+                    ┌─────────────────────────────┐
+                    │  AFontMatcher_match(700)      │
+                    │  → path, axisCount            │
+                    └────────────┬────────────────┘
+                                 │
+              ┌──────────────────┼──────────────────┐
+              ▼                  ▼                   ▼
+        axisCount > 0     path != regPath       path == regPath
+        (Variable Font)   (Separate file)       (Same file)
+              │                  │                   │
+        Clone VF          Load bold file       gUseFakeBold=true
+        wght=700          directly             SkFont::setEmbolden(true)
+              │                  │                   │
+        ✅ OneUI 6+       ✅ AOSP Roboto-Bold   ✅ Samsung DroidSans
+           OneUISans                                G781V / FlipFont
+```
+
+**C++ — Global flag và embolden trong `setupFont()`:**
+
+```cpp
+static bool gUseFakeBold = false;
+
+void setupFont(sk_sp<SkTypeface> tf) {
+    fCurrentFont = SkFont(tf, fTextSize);
+    // ...
+    if (fIsBold && gUseFakeBold) {
+        fCurrentFont.setEmbolden(true);  // Skia native embolden
+    }
+}
+```
+
+**C++ — Logic phân nhánh khi load Bold typeface:**
+
+```cpp
+bool isSameFile = (regPath == boldPath);  // kiểm tra path thực tế
+
+if (isVF) {
+    baseTypefaceBold = createWeightTypeface(baseTypefaceRegular, 700.0f);
+    // → One UI 6+ / OneUISans VF
+} else if (isSameFile) {
+    baseTypefaceBold = baseTypefaceRegular;
+    gUseFakeBold = true;
+    // → G781V / Samsung DroidSans / FlipFont single-file
+} else {
+    // Load bold file riêng biệt
+    // → AOSP / Roboto-Bold.ttf
+}
+```
+
+**Java — Phát hiện weight axis thực sự:**
+
+```java
+Typeface tfBase = Typeface.create("sec", Typeface.NORMAL);
+Typeface tfBoldCandidate = Typeface.create(tfBase, 700, false);
+boolean secHasWeightAxis = (tfBoldCandidate.getWeight() >= 600);
+
+if (secHasWeightAxis) {
+    tvBold.setTypeface(tfBoldCandidate);              // One UI 6+ VF
+} else {
+    tvBold.setTypeface(Typeface.defaultFromStyle(Typeface.BOLD));  // One UI 5.1
+}
+```
+
+---
+
+### 6.5. Bảng tóm tắt hành vi theo thiết bị
+
+| Thiết bị | Font hệ thống | `axes` | Regular == Bold path? | Chiến lược Bold |
+|----------|---------------|--------|-----------------------|-----------------|
+| One UI 6+ (Galaxy S24) | `OneUISans-VF.ttf` | `wght` | Cùng file, khác axis | Clone VF `wght=700` |
+| One UI 5.1 / AOSP Roboto | `Roboto-Regular.ttf` | 0 | Khác file | Load `Roboto-Bold.ttf` |
+| **One UI 5.1 + FlipFont (G781V)** | `DroidSans.ttf` | 0 | **Cùng file** | `SkFont::setEmbolden(true)` |
+
+---
+
+### 6.6. Nguyên tắc thiết kế: Không dùng OS version check
+
+Thay vì kiểm tra `Build.VERSION.SDK_INT` hay tên thiết bị (fragile, bể khi OTA), hệ thống **hỏi trực tiếp OS**:
+
+```
+"Với family 'sec', weight=700, ký tự 'A' → mày sẽ dùng file nào?"
+          ↓ AFontMatcher_match()
+"→ /data/app_fonts/.../DroidSans.ttf (axes=0)"
+          ↓ so sánh với Regular path
+"→ Cùng file → dùng Skia embolden"
+```
+
+Cách này tự động đúng khi Samsung OTA thêm OneUISans vào thiết bị cũ, khi user thay đổi font qua FlipFont, hoặc khi chạy trên AOSP thuần — **không cần magic number hay device name nào cả**.

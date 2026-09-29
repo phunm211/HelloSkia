@@ -3,6 +3,7 @@
 #include <android/log.h>
 #include <android/font.h>
 #include <android/font_matcher.h>
+#include <android/system_fonts.h>
 #include <EGL/egl.h>
 #include <GLES3/gl32.h>
 
@@ -258,6 +259,10 @@ static SkUnichar nextUtf8Char(const char*& ptr, const char* end) {
 // Global cache for Typefaces resolved via AFontMatcher file paths to prevent redundant re-reading
 static std::unordered_map<std::string, sk_sp<SkTypeface>> gFontCache;
 static AFontMatcher* gFontMatcher = nullptr;
+// Detected system font family: "sec" on Samsung, "" (default) on AOSP
+static std::string gSystemFontFamily = "sec";
+// True when Regular and Bold resolve to same static file → use Skia embolden
+static bool gUseFakeBold = false;
 
 static sk_sp<SkFontMgr> getEmptyFontMgr() {
     static sk_sp<SkFontMgr> mgr = SkFontMgr_New_Custom_Empty();
@@ -345,7 +350,7 @@ public:
         AFontMatcher* matcher = getFontMatcher();
         AFontMatcher_setStyle(matcher, fIsBold ? 700 : 400, fIsItalic);
         uint32_t runLengthUtf16 = 0;
-        AFont* font = AFontMatcher_match(matcher, "sec", utf16.data(), (uint32_t)utf16.size(), &runLengthUtf16);
+        AFont* font = AFontMatcher_match(matcher, gSystemFontFamily.c_str(), utf16.data(), (uint32_t)utf16.size(), &runLengthUtf16);
 
         sk_sp<SkTypeface> matchedTf = nullptr;
         if (font) {
@@ -425,6 +430,10 @@ private:
         fCurrentFont.setSubpixel(true);
         fCurrentFont.setHinting(SkFontHinting::kNone);
         fCurrentFont.setLinearMetrics(true);
+        // Embolden when font has no separate bold file (e.g., Samsung DroidSans)
+        if (fIsBold && gUseFakeBold) {
+            fCurrentFont.setEmbolden(true);
+        }
         if (fIsItalic) {
             fCurrentFont.setSkewX(-0.25f);
         }
@@ -516,18 +525,135 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
     // 3. Sử dụng SkFontMgr_New_Custom_Empty() thay cho SkFontMgr_New_Android
     sk_sp<SkFontMgr> emptyFontMgr = getEmptyFontMgr();
 
-    // Load base typeface: prioritize OneUISans-VF.ttf on Samsung devices, fallback to Roboto
+    // Load base typeface dynamically using AFontMatcher.
+    // Strategy:
+    //   - One UI 6+ (OneUISans VF): AFontMatcher returns OneUISans-VF.ttf with wght axis set.
+    //     createWeightTypeface() then clones it with the correct axis value.
+    //   - One UI 5.1 (Roboto / SamsungOne static): AFontMatcher returns the actual *bold file*
+    //     (e.g., Roboto-Bold.ttf) when weight=700, so we load the correct file directly.
+    //     createWeightTypeface() on a static font is a no-op but harmless.
     static sk_sp<SkTypeface> baseTypefaceRegular = nullptr;
     static sk_sp<SkTypeface> baseTypefaceBold = nullptr;
     if (!baseTypefaceRegular) {
-        baseTypefaceRegular = emptyFontMgr->makeFromFile("/system/fonts/OneUISans-VF.ttf");
+        // Step 0: Detect gSystemFontFamily using ASystemFontIterator
+        // Check if "sec" family returns a OneUISans VF or a static font
+        static bool familyDetected = false;
+        if (!familyDetected) {
+            familyDetected = true;
+            uint16_t probe[] = { 'A' };
+            AFontMatcher* matcher = getFontMatcher();
+            AFontMatcher_setStyle(matcher, 700, false);
+            AFont* testFont = AFontMatcher_match(matcher, "sec", probe, 1, nullptr);
+            if (testFont) {
+                const char* path = AFont_getFontFilePath(testFont);
+                size_t axisCount = AFont_getAxisCount(testFont);
+                bool hasSec = (path != nullptr);
+                bool secIsVF = (axisCount > 0);
+                LOGI("[Font] Family detect: 'sec' exists=%d isVF=%d axes=%zu path=%s",
+                     hasSec, secIsVF, axisCount, path ? path : "null");
+                if (!hasSec) {
+                    // "sec" family not found, fall back to system default ""
+                    gSystemFontFamily = "";
+                }
+                // If secIsVF=false: "sec" is static (One UI 5.1/SamsungOne)
+                // Keep gSystemFontFamily="sec" since AFontMatcher still resolves
+                // the correct bold file when weight=700 is requested on static fonts
+                AFont_close(testFont);
+            } else {
+                gSystemFontFamily = "";
+                LOGI("[Font] Family detect: 'sec' not found, using system default");
+            }
+        }
+
+        // Use ASCII 'A' as a representative Latin glyph for font matching
+        uint16_t probe[] = { 'A' };
+        AFontMatcher* matcher = getFontMatcher();
+
+        // --- Load Regular base ---
+        AFontMatcher_setStyle(matcher, 400, false);
+        AFont* fontRegular = AFontMatcher_match(matcher, gSystemFontFamily.c_str(), probe, 1, nullptr);
+
+        if (fontRegular) {
+            const char* path = AFont_getFontFilePath(fontRegular);
+            int ttcIndex = (int)AFont_getCollectionIndex(fontRegular);
+            size_t axisCount = AFont_getAxisCount(fontRegular);
+            LOGI("[Font] Regular -> path=%s ttcIdx=%d axes=%zu", path ? path : "null", ttcIndex, axisCount);
+
+            if (path) {
+                SkFontArguments args;
+                args.setCollectionIndex(ttcIndex);
+                std::vector<SkFontArguments::VariationPosition::Coordinate> coords;
+                if (axisCount > 0) {
+                    coords.resize(axisCount);
+                    for (size_t i = 0; i < axisCount; ++i) {
+                        coords[i].axis  = AFont_getAxisTag(fontRegular, i);
+                        coords[i].value = AFont_getAxisValue(fontRegular, i);
+                    }
+                    args.setVariationDesignPosition({ coords.data(), (int)coords.size() });
+                }
+                auto stream = SkStream::MakeFromFile(path);
+                if (stream) baseTypefaceRegular = emptyFontMgr->makeFromStream(std::move(stream), args);
+                if (!baseTypefaceRegular) baseTypefaceRegular = emptyFontMgr->makeFromFile(path, ttcIndex);
+            }
+            AFont_close(fontRegular);
+        }
+
+        // --- Load Bold base ---
+        AFontMatcher_setStyle(matcher, 700, false);
+        AFont* fontBold = AFontMatcher_match(matcher, gSystemFontFamily.c_str(), probe, 1, nullptr);
+        if (fontBold) {
+            const char* path = AFont_getFontFilePath(fontBold);
+            int ttcIndex = (int)AFont_getCollectionIndex(fontBold);
+            size_t axisCount = AFont_getAxisCount(fontBold);
+            LOGI("[Font] Bold -> path=%s ttcIdx=%d axes=%zu", path ? path : "null", ttcIndex, axisCount);
+
+            if (path) {
+                // Check if it's a VF or a truly separate bold file vs same-file static
+                bool isVF = baseTypefaceRegular &&
+                            (std::string(path).find("-VF") != std::string::npos ||
+                             axisCount > 0);
+                // Check if bold path is SAME as regular path (single-file static font)
+                bool isSameFile = false;
+                {
+                    AFont* regCheck = AFontMatcher_match(getFontMatcher(), gSystemFontFamily.c_str(), probe, 1, nullptr);
+                    if (regCheck) {
+                        const char* regPath = AFont_getFontFilePath(regCheck);
+                        if (regPath && path && std::string(regPath) == std::string(path)) {
+                            isSameFile = true;
+                        }
+                        AFont_close(regCheck);
+                    }
+                }
+
+                if (isVF) {
+                    // Variable font: clone regular with wght=700
+                    baseTypefaceBold = createWeightTypeface(baseTypefaceRegular, 700.0f);
+                    LOGI("[Font] Bold strategy: clone VF with wght=700");
+                } else if (isSameFile) {
+                    // Same static file for regular & bold → use Skia embolden (fake bold)
+                    baseTypefaceBold = baseTypefaceRegular;
+                    gUseFakeBold = true;
+                    LOGI("[Font] Bold strategy: same file detected → Skia embolden (fake bold)");
+                } else {
+                    // Separate bold file: load it directly
+                    SkFontArguments args;
+                    args.setCollectionIndex(ttcIndex);
+                    auto stream = SkStream::MakeFromFile(path);
+                    if (stream) baseTypefaceBold = emptyFontMgr->makeFromStream(std::move(stream), args);
+                    if (!baseTypefaceBold) baseTypefaceBold = emptyFontMgr->makeFromFile(path, ttcIndex);
+                    LOGI("[Font] Bold strategy: load separate bold file");
+                }
+            }
+            AFont_close(fontBold);
+        }
+
+        // Final fallback: if still null, use hardcoded paths
         if (!baseTypefaceRegular) {
             baseTypefaceRegular = emptyFontMgr->makeFromFile("/system/fonts/RobotoStatic-Regular.ttf");
+            if (!baseTypefaceRegular)
+                baseTypefaceRegular = emptyFontMgr->makeFromFile("/system/fonts/Roboto-Regular.ttf");
         }
-        if (!baseTypefaceRegular) {
-            baseTypefaceRegular = emptyFontMgr->makeFromFile("/system/fonts/Roboto-Regular.ttf");
-        }
-        if (baseTypefaceRegular) {
+        if (!baseTypefaceBold && baseTypefaceRegular) {
             baseTypefaceBold = createWeightTypeface(baseTypefaceRegular, 700.0f);
         }
     }
