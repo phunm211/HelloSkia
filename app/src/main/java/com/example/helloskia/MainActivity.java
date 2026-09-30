@@ -12,8 +12,8 @@ public class MainActivity extends Activity {
         System.loadLibrary("native-lib");
     }
 
-    private native void nativeInit(Surface surface, int width, int height, float textSizePx, int boldWeight);
-    private native void nativeResize(int width, int height, float textSizePx, int boldWeight);
+    private native void nativeInit(Surface surface, int width, int height, float textSizePx, int boldWeight, String fontPath);
+    private native void nativeResize(int width, int height, float textSizePx, int boldWeight, String fontPath);
     private native void nativeRender();
     private native void nativeDestroy();
 
@@ -49,20 +49,27 @@ public class MainActivity extends Activity {
                 // One UI 6+ with OneUISans VF: weight axis works correctly
                 tvNormal.setTypeface(android.graphics.Typeface.create(tfBase, 400, false));
                 tvBold.setTypeface(tfBoldCandidate);
-                tvBoldItalic.setTypeface(android.graphics.Typeface.create(tfBase, 700, true));
             } else {
                 // One UI 5.1 or earlier: "sec" is a static font, use system default
-                // which correctly handles bold via separate font file
                 tvNormal.setTypeface(android.graphics.Typeface.defaultFromStyle(android.graphics.Typeface.NORMAL));
                 tvBold.setTypeface(android.graphics.Typeface.defaultFromStyle(android.graphics.Typeface.BOLD));
-                tvBoldItalic.setTypeface(android.graphics.Typeface.defaultFromStyle(android.graphics.Typeface.BOLD_ITALIC));
             }
         } else {
             android.graphics.Typeface tfBase = android.graphics.Typeface.create("sec", android.graphics.Typeface.NORMAL);
             tvNormal.setTypeface(tfBase, android.graphics.Typeface.NORMAL);
             tvBold.setTypeface(tfBase, android.graphics.Typeface.BOLD);
-            tvBoldItalic.setTypeface(tfBase, android.graphics.Typeface.BOLD_ITALIC);
         }
+
+        // Row 3: Font nạp từ file với weight=400 (không set axis 700), nhưng BẬT BOLD (Fake Bold)
+        // Đây là case để so sánh giữa True Bold (wght=700 ở Row 2) vs Fake Bold (wght=400 + BOLD ở Row 3)
+        java.io.File vfFile = new java.io.File("/system/fonts/OneUISans-VF.ttf");
+        if (vfFile.exists()) {
+            android.graphics.Typeface tfFile400 = android.graphics.Typeface.createFromFile(vfFile);
+            tvBoldItalic.setTypeface(tfFile400, android.graphics.Typeface.BOLD);
+        } else {
+            tvBoldItalic.setTypeface(android.graphics.Typeface.create("sec", android.graphics.Typeface.NORMAL), android.graphics.Typeface.BOLD);
+        }
+        tvBoldItalic.getPaint().setFakeBoldText(true);
 
         surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override
@@ -117,11 +124,16 @@ public class MainActivity extends Activity {
                         textSizePx, dm.densityDpi, dm.density, normalWeight, tfNormal != null && tfNormal.isBold(), paintNormal.isFakeBoldText(),
                         boldWeight, tfBold != null && tfBold.isBold(), paintBold.isFakeBoldText(), paintBold.getTextSkewX()));
 
+                String appFontPath = "";
+                if (new java.io.File("/system/fonts/OneUISans-VF.ttf").exists()) {
+                    appFontPath = "/system/fonts/OneUISans-VF.ttf";
+                }
+
                 if (!isInitialized) {
-                    nativeInit(holder.getSurface(), width, height, textSizePx, boldWeight);
+                    nativeInit(holder.getSurface(), width, height, textSizePx, boldWeight, appFontPath);
                     isInitialized = true;
                 } else {
-                    nativeResize(width, height, textSizePx, boldWeight);
+                    nativeResize(width, height, textSizePx, boldWeight, appFontPath);
                 }
                 nativeRender();
             }

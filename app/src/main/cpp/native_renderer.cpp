@@ -12,6 +12,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <memory>
+#include <unistd.h>
 
 #include "modules/skshaper/include/SkShaper.h"
 #include "modules/skshaper/include/SkShaper_harfbuzz.h"
@@ -57,6 +58,7 @@ static int surfaceWidth = 0;
 static int surfaceHeight = 0;
 static float globalTextSizePx = 190.0f;
 static int globalBoldWeight = 700;
+static std::string gAppFontPath = "";
 
 // 3 GL Textures
 static GLuint glTextureIds[3] = {0, 0, 0};
@@ -91,7 +93,7 @@ static void createGLTextures(int width, int height) {
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_example_helloskia_MainActivity_nativeInit(JNIEnv* env, jobject, jobject surface, jint width, jint height, jfloat textSizePx, jint boldWeight) {
+Java_com_example_helloskia_MainActivity_nativeInit(JNIEnv* env, jobject, jobject surface, jint width, jint height, jfloat textSizePx, jint boldWeight, jstring fontPath) {
     surfaceWidth = width;
     surfaceHeight = height;
     if (textSizePx > 0.0f) {
@@ -100,7 +102,17 @@ Java_com_example_helloskia_MainActivity_nativeInit(JNIEnv* env, jobject, jobject
     if (boldWeight > 0) {
         globalBoldWeight = boldWeight;
     }
-    LOGI("nativeInit: textSizePx = %f, boldWeight = %d", globalTextSizePx, globalBoldWeight);
+    if (fontPath != nullptr) {
+        const char* cPath = env->GetStringUTFChars(fontPath, nullptr);
+        if (cPath) {
+            gAppFontPath = cPath;
+            env->ReleaseStringUTFChars(fontPath, cPath);
+        }
+    } else {
+        gAppFontPath = "";
+    }
+    LOGI("nativeInit: textSizePx = %f, boldWeight = %d, fontPath = '%s'",
+         globalTextSizePx, globalBoldWeight, gAppFontPath.c_str());
 
     // 1. Get Native Window
     nativeWindow = ANativeWindow_fromSurface(env, surface);
@@ -201,7 +213,7 @@ Java_com_example_helloskia_MainActivity_nativeInit(JNIEnv* env, jobject, jobject
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_example_helloskia_MainActivity_nativeResize(JNIEnv*, jobject, jint width, jint height, jfloat textSizePx, jint boldWeight) {
+Java_com_example_helloskia_MainActivity_nativeResize(JNIEnv* env, jobject, jint width, jint height, jfloat textSizePx, jint boldWeight, jstring fontPath) {
     surfaceWidth = width;
     surfaceHeight = height;
     if (textSizePx > 0.0f) {
@@ -209,6 +221,13 @@ Java_com_example_helloskia_MainActivity_nativeResize(JNIEnv*, jobject, jint widt
     }
     if (boldWeight > 0) {
         globalBoldWeight = boldWeight;
+    }
+    if (fontPath != nullptr) {
+        const char* cPath = env->GetStringUTFChars(fontPath, nullptr);
+        if (cPath) {
+            gAppFontPath = cPath;
+            env->ReleaseStringUTFChars(fontPath, cPath);
+        }
     }
     if (!grContext) return;
 
@@ -310,9 +329,9 @@ static sk_sp<SkTypeface> createWeightTypeface(sk_sp<SkTypeface> tf, float weight
 class AFontMatcherRunIterator : public SkShaper::FontRunIterator {
 public:
     AFontMatcherRunIterator(const char* utf8, size_t utf8Bytes, SkScalar textSize, bool isBold, bool isItalic,
-                            sk_sp<SkTypeface> baseTypeface)
+                            sk_sp<SkTypeface> baseTypeface, bool forceFakeBold = false)
             : fUtf8(utf8), fUtf8Bytes(utf8Bytes), fTextSize(textSize), fIsBold(isBold), fIsItalic(isItalic),
-              fBaseTypeface(baseTypeface), fCurrentOffset(0) {
+              fBaseTypeface(baseTypeface), fForceFakeBold(forceFakeBold), fCurrentOffset(0) {
         consume();
     }
 
@@ -430,8 +449,8 @@ private:
         fCurrentFont.setSubpixel(true);
         fCurrentFont.setHinting(SkFontHinting::kNone);
         fCurrentFont.setLinearMetrics(true);
-        // Embolden when font has no separate bold file (e.g., Samsung DroidSans)
-        if (fIsBold && gUseFakeBold) {
+        // Embolden when requested explicitly or when font has no separate bold file (e.g., Samsung DroidSans)
+        if (fForceFakeBold || (fIsBold && gUseFakeBold)) {
             fCurrentFont.setEmbolden(true);
         }
         if (fIsItalic) {
@@ -445,6 +464,7 @@ private:
     bool fIsBold;
     bool fIsItalic;
     sk_sp<SkTypeface> fBaseTypeface;
+    bool fForceFakeBold;
     size_t fCurrentOffset;
     SkFont fCurrentFont;
 };
@@ -485,7 +505,7 @@ private:
 };
 
 // Render content into a single backend texture
-static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool isItalic, const char* text) {
+static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool isItalic, const char* text, bool forceFakeBold = false) {
     GrGLTextureInfo glInfo;
     glInfo.fTarget = GL_TEXTURE_2D;
     glInfo.fID = texId;
@@ -525,18 +545,34 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
     // 3. Sử dụng SkFontMgr_New_Custom_Empty() thay cho SkFontMgr_New_Android
     sk_sp<SkFontMgr> emptyFontMgr = getEmptyFontMgr();
 
-    // Load base typeface dynamically using AFontMatcher.
-    // Strategy:
-    //   - One UI 6+ (OneUISans VF): AFontMatcher returns OneUISans-VF.ttf with wght axis set.
-    //     createWeightTypeface() then clones it with the correct axis value.
-    //   - One UI 5.1 (Roboto / SamsungOne static): AFontMatcher returns the actual *bold file*
-    //     (e.g., Roboto-Bold.ttf) when weight=700, so we load the correct file directly.
-    //     createWeightTypeface() on a static font is a no-op but harmless.
+    // Load base typeface dynamically using AFontMatcher or system OneUI font.
     static sk_sp<SkTypeface> baseTypefaceRegular = nullptr;
     static sk_sp<SkTypeface> baseTypefaceBold = nullptr;
     if (!baseTypefaceRegular) {
-        // Step 0: Detect gSystemFontFamily using ASystemFontIterator
-        // Check if "sec" family returns a OneUISans VF or a static font
+        // Step 0: Check for fontPath explicitly passed down from Java / App.
+        // Reason: Android TextView has ground truth font selection (e.g. OneUISans-VF.ttf or custom font).
+        // Passing fontPath directly from App guarantees 100% font fidelity without hardcoding or heuristics.
+        if (!gAppFontPath.empty() && access(gAppFontPath.c_str(), R_OK) == 0) {
+            LOGI("[Font] Using explicit fontPath from App: %s", gAppFontPath.c_str());
+            SkFontArguments argsReg;
+            SkFontArguments::VariationPosition::Coordinate coordReg = { SkSetFourByteTag('w', 'g', 'h', 't'), 400.0f };
+            argsReg.setVariationDesignPosition({ &coordReg, 1 });
+            auto streamReg = SkStream::MakeFromFile(gAppFontPath.c_str());
+            if (streamReg) baseTypefaceRegular = emptyFontMgr->makeFromStream(std::move(streamReg), argsReg);
+            if (!baseTypefaceRegular) baseTypefaceRegular = emptyFontMgr->makeFromFile(gAppFontPath.c_str(), 0);
+
+            if (baseTypefaceRegular) {
+                if (globalBoldWeight > 0) {
+                    baseTypefaceBold = createWeightTypeface(baseTypefaceRegular, (float)globalBoldWeight);
+                    LOGI("[Font] Base Bold created from explicit fontPath via VF wght=%d", globalBoldWeight);
+                } else {
+                    baseTypefaceBold = baseTypefaceRegular;
+                }
+            }
+        }
+
+        // If not Samsung or file missing, fallback to dynamic detection via AFontMatcher
+        if (!baseTypefaceRegular) {
         static bool familyDetected = false;
         if (!familyDetected) {
             familyDetected = true;
@@ -552,12 +588,8 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
                 LOGI("[Font] Family detect: 'sec' exists=%d isVF=%d axes=%zu path=%s",
                      hasSec, secIsVF, axisCount, path ? path : "null");
                 if (!hasSec) {
-                    // "sec" family not found, fall back to system default ""
                     gSystemFontFamily = "";
                 }
-                // If secIsVF=false: "sec" is static (One UI 5.1/SamsungOne)
-                // Keep gSystemFontFamily="sec" since AFontMatcher still resolves
-                // the correct bold file when weight=700 is requested on static fonts
                 AFont_close(testFont);
             } else {
                 gSystemFontFamily = "";
@@ -565,7 +597,6 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
             }
         }
 
-        // Use ASCII 'A' as a representative Latin glyph for font matching
         uint16_t probe[] = { 'A' };
         AFontMatcher* matcher = getFontMatcher();
 
@@ -608,11 +639,9 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
             LOGI("[Font] Bold -> path=%s ttcIdx=%d axes=%zu", path ? path : "null", ttcIndex, axisCount);
 
             if (path) {
-                // Check if it's a VF or a truly separate bold file vs same-file static
                 bool isVF = baseTypefaceRegular &&
                             (std::string(path).find("-VF") != std::string::npos ||
                              axisCount > 0);
-                // Check if bold path is SAME as regular path (single-file static font)
                 bool isSameFile = false;
                 {
                     AFont* regCheck = AFontMatcher_match(getFontMatcher(), gSystemFontFamily.c_str(), probe, 1, nullptr);
@@ -626,16 +655,18 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
                 }
 
                 if (isVF) {
-                    // Variable font: clone regular with wght=700
-                    baseTypefaceBold = createWeightTypeface(baseTypefaceRegular, 700.0f);
-                    LOGI("[Font] Bold strategy: clone VF with wght=700");
+                    if (globalBoldWeight > 0) {
+                        baseTypefaceBold = createWeightTypeface(baseTypefaceRegular, (float)globalBoldWeight);
+                        LOGI("[Font] Bold strategy: clone VF with wght=%d (explicit weight > 0)", globalBoldWeight);
+                    } else {
+                        baseTypefaceBold = baseTypefaceRegular;
+                        LOGI("[Font] Bold strategy: VF axis ignored (weight <= 0)");
+                    }
                 } else if (isSameFile) {
-                    // Same static file for regular & bold → use Skia embolden (fake bold)
                     baseTypefaceBold = baseTypefaceRegular;
                     gUseFakeBold = true;
                     LOGI("[Font] Bold strategy: same file detected → Skia embolden (fake bold)");
                 } else {
-                    // Separate bold file: load it directly
                     SkFontArguments args;
                     args.setCollectionIndex(ttcIndex);
                     auto stream = SkStream::MakeFromFile(path);
@@ -654,11 +685,17 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
                 baseTypefaceRegular = emptyFontMgr->makeFromFile("/system/fonts/Roboto-Regular.ttf");
         }
         if (!baseTypefaceBold && baseTypefaceRegular) {
-            baseTypefaceBold = createWeightTypeface(baseTypefaceRegular, 700.0f);
+            if (globalBoldWeight > 0) {
+                baseTypefaceBold = createWeightTypeface(baseTypefaceRegular, (float)globalBoldWeight);
+            } else {
+                baseTypefaceBold = baseTypefaceRegular;
+            }
+        }
         }
     }
 
-    sk_sp<SkTypeface> curBaseTypeface = (isBold && baseTypefaceBold) ? baseTypefaceBold : baseTypefaceRegular;
+    // Nếu forceFakeBold = true (hàng 3): Dùng font Regular (wght=400, không set trục 700), nhưng bật fake bold
+    sk_sp<SkTypeface> curBaseTypeface = forceFakeBold ? baseTypefaceRegular : ((isBold && baseTypefaceBold) ? baseTypefaceBold : baseTypefaceRegular);
 
     // 4. Khởi tạo SkShaper (HarfBuzz) và SkUnicode (ICU)
     static std::unique_ptr<SkShaper> shaper = nullptr;
@@ -680,14 +717,14 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
     }
 
     SkFont baseFont(curBaseTypeface, globalTextSizePx);
+    if (forceFakeBold) {
+        baseFont.setEmbolden(true);
+    }
     SkFontMetrics metrics;
     baseFont.getMetrics(&metrics);
 
     SkScalar lineHeight = metrics.fDescent - metrics.fAscent + metrics.fLeading;
     SkScalar totalTextBlockHeight = lines.size() * lineHeight;
-    // Note: SkTextBlobBuilderRunHandler already offsets glyph baseline by maxRunAscent,
-    // so the blob origin (0, 0) is at the top of the line.
-    // Proportional compensation for Android TextView default includeFontPadding:
     SkScalar fontPaddingOffset = globalTextSizePx * (4.0f / 46.75f);
     SkScalar startY = (h - totalTextBlockHeight) / 2.0f + fontPaddingOffset;
 
@@ -696,7 +733,7 @@ static void renderCellToTexture(GLuint texId, int w, int h, bool isBold, bool is
         if (curLine.empty()) continue;
 
         // Shape with HarfBuzz & AFontMatcher
-        AFontMatcherRunIterator fontIter(curLine.data(), curLine.size(), globalTextSizePx, isBold, isItalic, curBaseTypeface);
+        AFontMatcherRunIterator fontIter(curLine.data(), curLine.size(), globalTextSizePx, isBold, isItalic, curBaseTypeface, forceFakeBold);
         std::unique_ptr<SkShaper::BiDiRunIterator> bidiIter =
                 SkShaper::MakeBiDiRunIterator(curLine.data(), curLine.size(), 0);
         std::unique_ptr<SkShaper::ScriptRunIterator> scriptIter =
@@ -737,14 +774,14 @@ Java_com_example_helloskia_MainActivity_nativeRender(JNIEnv*, jobject) {
     const char* sampleText = "Hello\n안녕하세요\n😀🎉🚀\nשלום\nمرحبا";
 
     // --- BƯỚC 1: Render 3 nội dung vào 3 OpenGL Textures matching TextView ---
-    // Texture 0: Normal (isBold=false, isItalic=false)
-    renderCellToTexture(glTextureIds[0], cellW, cellH, false, false, sampleText);
+    // Texture 0: Normal (isBold=false, isItalic=false, forceFakeBold=false) -> wght=400
+    renderCellToTexture(glTextureIds[0], cellW, cellH, false, false, sampleText, false);
 
-    // Texture 1: Bold (isBold=true, isItalic=false)
-    renderCellToTexture(glTextureIds[1], cellW, cellH, true, false, sampleText);
+    // Texture 1: True Bold (isBold=true, isItalic=false, forceFakeBold=false) -> wght=700 (True VF Bold axis)
+    renderCellToTexture(glTextureIds[1], cellW, cellH, true, false, sampleText, false);
 
-    // Texture 2: Bold Italic (isBold=true, isItalic=true)
-    renderCellToTexture(glTextureIds[2], cellW, cellH, true, true, sampleText);
+    // Texture 2: Weight 400 + Fake Bold (isBold=true, isItalic=false, forceFakeBold=true) -> wght=400 + Skia embolden
+    renderCellToTexture(glTextureIds[2], cellW, cellH, true, false, sampleText, true);
 
     // --- BƯỚC 2: Render thẳng 3 Texture lên Main Canvas ---
     SkCanvas* mainCanvas = mainSurface->getCanvas();

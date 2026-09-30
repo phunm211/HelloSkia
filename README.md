@@ -155,34 +155,51 @@ Sau khi chuyển TextView sang sử dụng Samsung OneUI Sans, chữ `Hello` ở
 
 ---
 
-### 5.3. Tại sao không thể giải quyết ở tầng C++?
-1. **Nguyên tắc "Single Source of Truth"**:
-   * Mục tiêu thiết kế là **Skia và TextView phải cùng hiển thị một thiết kế font chuẩn (One UI Sans)** với đúng chuẩn Typography của hệ thống Samsung.
-   * Lỗi sai ở đây **nằm hoàn toàn ở phía TextView (Java)**: TextView đã không áp dụng được thuộc tính Bold do cách nạp font bị lỗi giới hạn API, chứ không phải Skia vẽ sai.
-2. **Nếu sửa ở tầng C++ (Hạ trọng số Skia xuống hoặc ép Skia vẽ Regular)**:
-   * Nếu ở C++, chúng ta ép Skia render với `wght = 400` hoặc hạ xuống 500/600 để "bắt chước" cái sai của TextView, thì dòng **Bold của Skia sẽ bị mất tính chất Bold** (cả dòng 1 Regular và dòng 2 Bold đều hiển thị nét mảnh như nhau).
-   * Điều này phá vỡ hợp đồng giao diện: dòng 2 là dòng đại diện cho `textStyle="bold"`.
-   * Hơn nữa, nếu ép Skia sửa sai để theo Java, khi người dùng hoặc hệ thống kích hoạt Bold đúng cách, Skia lại trở thành bên bị sai lệch.
-3. **Giải pháp chuẩn xác ở tầng Java**:
-   * Thay vì nạp file thủ công qua đường dẫn file thô, ta yêu cầu Android tải thông qua tên font family hệ thống:
-     ```java
-     Typeface tfBase = Typeface.create("sec", Typeface.NORMAL);
-     tvNormal.setTypeface(Typeface.create(tfBase, 400, false));
-     tvBold.setTypeface(Typeface.create(tfBase, 700, false));
-     tvBoldItalic.setTypeface(Typeface.create(tfBase, 700, true));
-     ```
-   * Khi gọi `Typeface.create("sec", ...)`, Android Font Manager sẽ đọc trực tiếp từ cấu hình `/system/etc/fonts.xml` của Samsung:
-     ```xml
-     <family name="sec">
-         <font weight="400" style="normal">OneUISans-VF.ttf
-             <axis tag="wght" stylevalue="400" />
-         </font>
-         <font weight="700" style="normal">OneUISans-VF.ttf
-             <axis tag="wght" stylevalue="700" />
-         </font>
-     </family>
-     ```
-   * Lúc này, Android framework nhận thức được ánh xạ biến thiên và nạp đúng trục **`wght = 700`** cho `tvBold`. Cả hai bên Skia và TextView đều hiển thị chuẩn nét đậm Bold thật với cùng độ dày thân nét ~12-13px.
+### 5.3. Tại sao không thể giải quyết bằng cách "đoán mò" ở C++ & Giải pháp Giao thức Weight rõ ràng
+
+#### 1. Quan điểm thiết kế: TextView là Ground Truth (Chuẩn thực tế)
+* Trong ứng dụng Android thực tế, **TextView của hệ thống chính là Ground Truth** đối với người dùng. Bất kể Skia tuân thủ chuẩn font designer ra sao, nếu Skia hiển thị khác TextView thì về mặt trải nghiệm UI vẫn bị coi là lệch pha.
+* Nếu Java nạp font từ file thông thường (không cấu hình trục `wght`), TextView sẽ hiển thị font ở trạng thái mặc định (`wght = 400`). Nếu C++ tự ý can thiệp `VariationPosition (wght=700)` vì thấy file có hỗ trợ VF, C++ sẽ đậm hơn TextView $\rightarrow$ Lệch nét.
+* Ngược lại, nếu C++ hoàn toàn bỏ qua `VariationPosition` trong mọi trường hợp, khi Java kích hoạt Bold hợp lệ (hoặc app muốn Bold thật), C++ lại bị kẹt ở nét mảnh $\rightarrow$ Lại lệch nét.
+
+#### 2. Giải pháp kiến trúc: Giao thức Weight tường minh (Explicit Contract) giữa Java và C++
+Thay vì để tầng C++ tự "đoán mò" (heuristics) xem app muốn gì:
+* **Quy tắc giao tiếp**:
+  * **Nếu App nạp từ file tùy chỉnh / muốn ép trục biến thiên**: Java chủ động gửi xuống Native một giá trị trọng số cụ thể: **`boldWeight > 0`** (ví dụ: `700`, `800`, `300`...).
+  * **Nếu App sử dụng Typeface thông thường / Font Family hệ thống**: Java gửi xuống **`boldWeight = 0`** (báo hiệu: không can thiệp trục biến thiên, giữ nguyên mặc định giống TextView).
+* **Xử lý ở tầng C++**:
+  ```cpp
+  if (isVF) {
+      if (globalBoldWeight > 0) {
+          // Chỉ định rõ weight: Áp dụng VariationPosition wght = globalBoldWeight
+          baseTypefaceBold = createWeightTypeface(baseTypefaceRegular, (float)globalBoldWeight);
+      } else {
+          // boldWeight <= 0: Bỏ qua (ignore) VariationPosition, giữ nguyên default của font
+          baseTypefaceBold = baseTypefaceRegular;
+      }
+  }
+  ```
+
+#### 3. Cấu hình chuẩn xác ở tầng Java cho One UI
+Khi ứng dụng muốn sử dụng đầy đủ sức mạnh của Variable Font gia đình OneUI, Java yêu cầu hệ thống nạp thông qua tên family chuẩn:
+```java
+Typeface tfBase = Typeface.create("sec", Typeface.NORMAL);
+tvNormal.setTypeface(Typeface.create(tfBase, 400, false));
+tvBold.setTypeface(Typeface.create(tfBase, 700, false));
+tvBoldItalic.setTypeface(Typeface.create(tfBase, 700, true));
+```
+* Khi gọi `Typeface.create("sec", ...)`, Android Font Manager sẽ đọc trực tiếp từ cấu hình `/system/etc/fonts.xml` của Samsung:
+  ```xml
+  <family name="sec">
+      <font weight="400" style="normal">OneUISans-VF.ttf
+          <axis tag="wght" stylevalue="400" />
+      </font>
+      <font weight="700" style="normal">OneUISans-VF.ttf
+          <axis tag="wght" stylevalue="700" />
+      </font>
+  </family>
+  ```
+* Lúc này, Android framework nhận thức được ánh xạ biến thiên và nạp đúng trục **`wght = 700`** cho `tvBold`. Cả hai bên Skia và TextView đều hiển thị chuẩn nét đậm Bold thật với cùng độ dày thân nét ~12-13px.
 
 ![Kết quả sau khi sửa: Cả hai bên cùng kích hoạt OneUI Bold thật đồng bộ tuyệt đối](docs/images/after_fix_perfect_match.png)
 
@@ -326,3 +343,64 @@ Thay vì kiểm tra `Build.VERSION.SDK_INT` hay tên thiết bị (fragile, bể
 ```
 
 Cách này tự động đúng khi Samsung OTA thêm OneUISans vào thiết bị cũ, khi user thay đổi font qua FlipFont, hoặc khi chạy trên AOSP thuần — **không cần magic number hay device name nào cả**.
+
+---
+
+## 7. Vấn đề lệch Glyph chữ Latin ("e") ở Case 1 (Normal) và Root Cause NDK AFontMatcher
+
+### 7.1. Hiện tượng phát hiện ở Case 1 (Normal)
+Khi so sánh từ `"Hello"` ở cả 3 hàng, đặc biệt là **Hàng 1 (Normal — không in đậm)**:
+* Chữ **`e`** bên TextView (cột trái): Nét gạch ngang ở giữa, đuôi cong hất lên với nét cắt vát chéo, khoang rỗng hình elip dẹt.
+* Chữ **`e`** bên Skia (cột phải): Đuôi cong dưới kết thúc bằng nét cắt ngang phẳng lỳ, khoang rỗng tròn đều $\rightarrow$ **Skia đang hiển thị font Roboto thay vì OneUISans**!
+
+### 7.2. Nguyên nhân gốc rễ (Root Cause)
+1. **Sự khác biệt giữa Java Typeface và NDK AFontMatcher**:
+   * Ở Java: `android.graphics.Typeface.create("sec", ...)` do framework `Typeface.java` của Samsung xử lý trực tiếp. Nó tra cứu bảng `<family name="sec">` trong `/system/etc/fonts.xml` và ánh xạ thành công sang `/system/fonts/OneUISans-VF.ttf`.
+   * Ở C++ NDK: `AFontMatcher_match(matcher, "sec", probe, 1, ...)` với ký tự kiểm tra ASCII `'A'`. NDK font matcher nhận diện `'A'` thuộc bảng mã Latin, và ưu tiên phân giải theo họ sans-serif mặc định đầu tiên của Android OS (`<family name="sans-serif">` $\rightarrow$ `/system/fonts/Roboto-Regular.ttf`), **bỏ qua hoàn toàn family `"sec"` của Samsung**.
+2. **Hậu quả**:
+   * Skia nạp `baseTypefaceRegular` là `Roboto-Regular.ttf`.
+   * Vì Roboto có đầy đủ các ký tự Latin (`'H'`, `'e'`, `'l'`, `'l'`, `'o'`), hàm `unicharToGlyph` trả về mã glyph hợp lệ $\rightarrow$ Skia vẽ toàn bộ chữ tiếng Anh bằng **Roboto**, trong khi TextView vẽ bằng **One UI Sans**!
+   * Điều này dẫn đến sự khác biệt ở tất cả các hàng (Normal, True Bold, Fake Bold).
+
+### 7.3. Giải pháp chuẩn kiến trúc: Giao thức App truyền trực tiếp `fontPath` xuống Native
+Thay vì để tầng C++ tự "đoán mò" (heuristics) hoặc hardcode đường dẫn font hệ thống (vốn là cách làm mang tính chắp vá / workaround):
+* **Nguyên tắc "TextView là Ground Truth"**: Tầng App (Java) là nơi quản lý layout, cấu hình giao diện và biết chính xác font mà TextView đang sử dụng (ví dụ: `/system/fonts/OneUISans-VF.ttf` hoặc font tùy chỉnh của app).
+* **Kiến trúc giao tiếp**:
+  1. **Java**: Truyền tường minh `fontPath` qua JNI (`nativeInit` và `nativeResize`):
+     ```java
+     String appFontPath = "";
+     if (new File("/system/fonts/OneUISans-VF.ttf").exists()) {
+         appFontPath = "/system/fonts/OneUISans-VF.ttf";
+     }
+     nativeInit(holder.getSurface(), width, height, textSizePx, boldWeight, appFontPath);
+     ```
+  2. **C++**: Nhận `fontPath` từ App và nạp làm `baseTypefaceRegular` (đồng thời clone trục `wght = boldWeight` nếu là font biến thiên VF):
+     ```cpp
+     if (!gAppFontPath.empty() && access(gAppFontPath.c_str(), R_OK) == 0) {
+         LOGI("[Font] Using explicit fontPath from App: %s", gAppFontPath.c_str());
+         SkFontArguments argsReg;
+         SkFontArguments::VariationPosition::Coordinate coordReg = { SkSetFourByteTag('w', 'g', 'h', 't'), 400.0f };
+         argsReg.setVariationDesignPosition({ &coordReg, 1 });
+         auto streamReg = SkStream::MakeFromFile(gAppFontPath.c_str());
+         if (streamReg) baseTypefaceRegular = emptyFontMgr->makeFromStream(std::move(streamReg), argsReg);
+         if (!baseTypefaceRegular) baseTypefaceRegular = emptyFontMgr->makeFromFile(gAppFontPath.c_str(), 0);
+
+         if (baseTypefaceRegular) {
+             if (globalBoldWeight > 0) {
+                 baseTypefaceBold = createWeightTypeface(baseTypefaceRegular, (float)globalBoldWeight);
+             } else {
+                 baseTypefaceBold = baseTypefaceRegular;
+             }
+         }
+     }
+     ```
+  3. **Fallback**: Nếu `fontPath` để trống (`""`), C++ tự động rơi về cơ chế tra cứu động qua `AFontMatcher` mặc định của hệ điều hành.
+
+* **Kết quả**: Cả 3 hàng (Normal, True Bold, Fake Bold) giữa TextView và Skia khớp hoàn hảo từng glyph, độ dày nét và khẩu độ mở của chữ `e` mà không cần bất kỳ hardcode nào ở tầng C++.
+
+![So sánh chữ Hello 3 hàng giữa TextView và Skia sau khi nạp OneUISans](docs/images/all_rows_comparison_oneui.png)
+*(Cột trái: Android TextView — Cột phải: Skia. Hàng 1: Normal, Hàng 2: True Bold, Hàng 3: Fake Bold)*
+
+![Chi tiết chữ Hello Hàng 1 phóng to 200%: Chữ e và toàn bộ ký tự khớp tuyệt đối](docs/images/r1_hello_2x.png)
+
+
